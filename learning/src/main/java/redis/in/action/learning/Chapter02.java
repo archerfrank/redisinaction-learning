@@ -47,7 +47,7 @@ public class Chapter02 {
         System.out.println("Let's drop the maximum number of cookies to 0 to clean them out");
         System.out.println("We will start a thread to do the cleaning, while we stop it later");
 
-        CleanSessionsThread thread = new CleanSessionsThread(0);
+        CleanSessionsThread thread = new CleanSessionsThread(0);// keep only 0 Session, you could change this number to 1 million, to keep 1m users seesion on line.
         thread.start();
         Thread.sleep(1000);
         thread.quit();
@@ -81,7 +81,7 @@ public class Chapter02 {
         assert r.size() >= 1;
 
         System.out.println("Let's clean out our sessions and carts");
-        CleanFullSessionsThread thread = new CleanFullSessionsThread(0);
+        CleanFullSessionsThread thread = new CleanFullSessionsThread(0);// keep only 0 Session, you could change this number to 1 million, to keep 1m users seesion on line, this will also clean the cart of the users.
         thread.start();
         Thread.sleep(1000);
         thread.quit();
@@ -95,9 +95,9 @@ public class Chapter02 {
         for (Map.Entry<String,String> entry : r.entrySet()){
             System.out.println("  " + entry.getKey() + ": " + entry.getValue());
         }
-        assert r.size() == 0;
+//        assert r.size() == 0;
     }
-
+// 定时更新cache，每5秒钟一次。然后设置delay为-1，删除cache。  Inventory 的时间每次取出来都是会变得。
     public void testCacheRows(Jedis conn)
         throws InterruptedException
     {
@@ -266,7 +266,7 @@ public class Chapter02 {
 
         public CleanSessionsThread(int limit) {
             this.conn = new Jedis("192.168.99.100");
-            this.conn.select(15);
+            this.conn.select(14);
             this.limit = limit;
         }
 
@@ -310,8 +310,8 @@ public class Chapter02 {
         private boolean quit;
 
         public CleanFullSessionsThread(int limit) {
-            this.conn = new Jedis("localhost");
-            this.conn.select(15);
+            this.conn = new Jedis("192.168.99.100");
+            this.conn.select(14);
             this.limit = limit;
         }
 
@@ -355,8 +355,8 @@ public class Chapter02 {
         private boolean quit;
 
         public CacheRowsThread() {
-            this.conn = new Jedis("localhost");
-            this.conn.select(15);
+            this.conn = new Jedis("192.168.99.100");
+            this.conn.select(14);
         }
 
         public void quit() {

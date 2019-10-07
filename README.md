@@ -199,6 +199,65 @@ def wait_for_sync(mconn, sconn):
 
 
 ## Dealing with system failures
+
+When confronted with system failures, we have tools to help us recover when either snapshotting or append-only file logging         had been enabled. Redis includes two command-line applications for testing the status of a snapshot and an append-only file.         These commands are redis-check-aof and redis-check-dump. 
+
+```bash
+$ redis-check-aof
+Usage: redis-check-aof [--fix] <file.aof>
+$ redis-check-dump
+Usage: redis-check-dump <dump.rdb>$
+```
+
+If we provide --fix as an argument to redis-check-aof, the command will fix the file. Its method to fix an append-only file is simple: it scans through the provided AOF, looking         for an incomplete or incorrect command. Upon finding the first bad command, it trims the file to just before that command         would’ve been executed. For most situations, this will discard the last partial write command.
+
+### Replacing a failed master
+
+Machine A is running a copy of Redis that’s acting as the master, and machine B is running a copy of Redis that’s acting as         the slave. Unfortunately, machine A has just lost network connectivity for some reason that we haven’t yet been able to diagnose.         But we have machine C with Redis installed that we’d like to use as the new master.                  
+
+Our plan is simple: We’ll tell machine B to produce a fresh snapshot with SAVE. We’ll then copy that snapshot over to machine C. After the snapshot has been copied into the proper path, we’ll start Redis         on machine C. Finally, we’ll tell machine B to become a slave of machine C.
+
+Code like below.
+
+![](./imgs/077fig01_alt.jpg)
+
+
 ## Redis transactions
+
+Within Redis, there’s a simple method for handling a sequence of reads and writes that will be consistent with each other.         We begin our transaction by calling the special command MULTI, passing our series of commands, followed by EXEC. **The problem is that this simple transaction doesn’t actually do anything until EXEC is called, which means that we can’t use data we read to make decisions until after we may have needed it.**
+
+Use a Redis operation called **WATCH**, which we combine with MULTI and EXEC, and sometimes UNWATCH or DISCARD. When we’ve watched **keys** with WATCH, if at any time some other client replaces, updates, or deletes any keys that we’ve WATCHed before we have performed the EXEC operation, our operations against Redis will fail with an error message when we try to EXEC
+
+Redis will notify clients if someone else modified the data first, which is called optimistic locking (the actual locking that relational databases perform could be viewed as pessimistic)
+
+Please check *listItem* and *purchaseItem* in Java.
+
 ## Non-transactional pipelines
+
+```python
+pipe = conn.pipeline()
+```
+
+By passing True to the pipeline() method (or omitting it), we’re telling our client to wrap the sequence of commands that we’ll call with a MULTI/EXEC pair. If instead of passing True we were to pass False, we’d get an object that prepared and collected commands to execute similar to the transactional pipeline, only it wouldn’t         be wrapped with MULTI/EXEC. 
+
+Please check update_token() and benchmark example in Java.
+
+| Description | Bandwidth | Latency | update_table() calls per second | update_table_pipeline() calls per second |
+|---------------------------------------|--------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------|---------------------------------|------------------------------------------|
+| Local machine, Unix domain socket | >1 gigabit | 0.015ms | 3,761 | 6,394 |
+| Local machine, localhost | >1 gigabit | 0.015ms | 3,257 | 5,991 |
+| Remote machine, shared switch | 1 gigabit | 0.271ms | 739 | 2,841 |
+| Remote machine, connected through VPN | 1.8 megabit | 48ms | 3.67 | 18.2 |
+
+For high-latency connections, we can multiply performance by a factor of five using pipelines         over not using pipelines. Even with very low-latency remote connections, we’re able to improve performance by almost four         times.
+
 ## Diagnosing performance issues
+## redis-benchmark
+
+![](./imgs/088fig01_alt.jpg)
+
+Generally, compared to redis-benchmark running with a single client, we can expect the Python Redis client to perform at roughly 50–60% of what redis-benchmark will tell us for a single client and for nonpipelined commands, depending on the complexity of the command to call.                  If you find that your commands are running at about half of what you’d expect given redis-benchmark (about 25–30% of what redis-benchmark reports), or if you get errors reporting “Cannot assign requested address,” you may be accidentally creating a new connection         for every command.
+
+## Summary
+
+If there are two things you should take from this chapter, they are that the use of replication and append-only files can         go a long way toward keeping your data safe, and that using WATCH/MULTI/EXEC can keep your data from being corrupted by multiple clients working on the same data.

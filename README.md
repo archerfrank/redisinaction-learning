@@ -115,3 +115,90 @@ Example use and description
 * PTTL	PTTL key-name—Returns the number of milliseconds before the key will expire (available in Redis 2.6 and later)
 * PEXPIRE	PEXPIRE key-name milliseconds—Sets the key to expire in the given number of milliseconds (available in Redis 2.6 and later)
 * PEXPIREAT	PEXPIREAT key-name timestamp-milliseconds—Sets the expiration time to be the given Unix timestamp specified in milliseconds (available in Redis 2.6 and later)
+
+
+# Chapter 4 Keeping data safe and ensuring performance
+
+## Persisting data to disk
+### Snapshots
+Within Redis, there are two different ways of persisting data to disk. One is a method called **snapshotting** that takes the data as it exists at one moment in time and writes it to disk. The other method is called **AOF**, or append-only file, and it works by copying incoming write commands to disk as they happen. 
+
+Any Redis client can initiate a snapshot by calling the **BGSAVE** command. On platforms that support BGSAVE (basically all platforms except for Windows), Redis will fork, and the child process will write the snapshot to disk while the parent process continues to respond to commands.                            
+
+When a process forks, the underlying operating system makes a copy of the process. On Unix and Unix-like systems, the copying                  process is optimized such that, initially, all memory is shared between the child and parent processes. When either the parent                  or child process writes to memory, that memory will stop being shared
+
+A Redis client can also initiate a snapshot by calling the **SAVE** command, which causes Redis to stop responding to any/all commands until the snapshot completes. This command isn’t commonly used, except in situations where we need our data on disk, and either we’re okay waiting for it to complete, or we don’t have enough memory for a BGSAVE.
+
+If Redis is configured with save lines, such as *save 60 10000*, Redis will automatically trigger a BGSAVE operation if 10,000 writes have occurred within 60 seconds since the last successful save has started (using the configuration            option described). When multiple save lines are present, any time one of the rules match, a BGSAVE is triggered.
+
+As a point of personal experience, I’ve run Redis servers that used 50 gigabytes of memory on machines with 68 gigabytes of         memory inside a cloud provider running Xen virtualization. When trying to use BGSAVE with clients writing to Redis, forking would take 15 seconds or more, followed by 15–20 minutes for the snapshot to complete.         But with SAVE, the snapshot would finish in 3–5 minutes. For our use, a daily snapshot at 3 a.m. was sufficient, so we wrote scripts that         would stop clients from trying to access Redis, call SAVE, wait for the SAVE to finish, back up the resulting snapshot, and then signal to the clients that they could continue.
+
+### Append-only file persistence
+
+anyone could recover the entire dataset by replaying the append-only log from the beginning to the end. Redis has functionality that does this as well, and it’s enabled by setting the configuration option appendonly yes
+
+* _always_	Every write command to Redis results in a write to disk. This slows Redis down substantially if used.
+* _everysec_	Once per second, explicitly syncs write commands to disk.
+* _no_	Lets the operating system control syncing to disk.
+
+Append-only files are flexible, offering a variety of options to ensure that almost every level of paranoia can be addressed.         But there’s a dark side to AOF persistence, and that is **file size**.
+
+**Rewriting/compacting append-only files**
+
+Over         time, a growing AOF could cause your disk to run out of space, but more commonly, upon restart, Redis will be executing every         command in the AOF in order. When handling large AOFs, Redis can take a very long time to start up.                  To solve the growing AOF problem, we can use BGREWRITEAOF, which will rewrite the AOF to be as short as possible by removing redundant commands. BGREWRITEAOF works similarly to the snapshotting BGSAVE: performing a fork and subsequently rewriting the append-only log in the child.
+
+Using AOFs, there are two configuration options that enable automatic BGREWRITEAOF execution: *auto-aof-rewrite-percentage* and *auto-aof-rewrite-min-size*. Using the example values of *auto-aof-rewrite-percentage* 100 and *auto-aof-rewrite-min-size* 64mb, when AOF is enabled, Redis will initiate a BGREWRITEAOF when the AOF is at least 100% larger than it was when Redis last finished rewriting the AOF, and when the AOF is at least         64 megabytes in size.
+
+## Replicating data to other machines
+Though a variety of options control behavior of the slave itself, only one option is really necessary to enable slaving: **slaveof**. If we were to set *slaveof host port* in our configuration file, the Redis that’s started with that configuration will use the provided host and port as the master         Redis server it should connect to. If we have an already running system, we can tell a Redis server to stop slaving, or even         to slave to a new or different master. To connect to a new master, we can use the SLAVEOF host port command, or if we want to stop updating data from the master, we can use **SLAVEOF no one**.
+
+
+| Step | Master operations                                                                                        | Slave operations                                                                                          |   |   |
+|------|----------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------|---|---|
+| 1    | (waiting for a command)                                                                                  | (Re-)connects to the master; issues the SYNC command                                                      |   |   |
+| 2    | Starts BGSAVE operation; keeps a backlog of all write commands sent after BGSAVE                         | Serves old data (if any), or returns errors to commands (depending on configuration)                      |   |   |
+| 3    | Finishes BGSAVE; starts sending the snapshot to the slave; continues holding a backlog of write commands | Discards all old data (if any); starts loading the dump as it’s received                                  |   |   |
+| 4    | Finishes sending the snapshot to the slave; starts sending the write command backlog to the slave        | Finishes parsing the dump; starts responding to commands normally again                                   |   |   |
+| 5    | Finishes sending the backlog; starts live streaming of write commands as they happen                     | Finishes executing backlog of write commands from the master; continues executing commands as they happen |   |   |
+
+
+* when a slave initially connects to a master, any data that had been in memory will be lost, to be replaced by the data coming from the         master. 
+* Redis doesn’t support master-master replication
+
+
+Below is the code to verify the data is sync between master and slave.
+```python
+def wait_for_sync(mconn, sconn):
+    identifier = str(uuid.uuid4())
+    mconn.zadd('sync:wait', {identifier: time.time()})      #A
+
+    while not sconn.info()['master_link_status'] != 'up':   #B
+        time.sleep(.001)
+
+    while not sconn.zscore('sync:wait', identifier):        #C
+        time.sleep(.001)
+
+    deadline = time.time() + 1.01                           #D
+    while time.time() < deadline:                           #D
+        if sconn.info()['aof_pending_bio_fsync'] == 0:      #E
+            break                                           #E
+        time.sleep(.001)
+
+    mconn.zrem('sync:wait', identifier)                     #F
+    mconn.zremrangebyscore('sync:wait', 0, time.time()-900) #F
+# <end id="wait-for-sync"/>
+#A Add the token to the master
+#B Wait for the slave to sync (if necessary)
+#C Wait for the slave to receive the data change
+#D Wait up to 1 second
+#E Check to see if the data is known to be on disk
+#F Clean up our status and clean out older entries that may have been left there
+#END
+```
+**By combining replication and append-only files, we can configure Redis to be resilient against system failures.**
+
+
+## Dealing with system failures
+## Redis transactions
+## Non-transactional pipelines
+## Diagnosing performance issues

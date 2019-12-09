@@ -261,3 +261,269 @@ Generally, compared to redis-benchmark running with a single client, we can expe
 ## Summary
 
 If there are two things you should take from this chapter, they are that the use of replication and append-only files can         go a long way toward keeping your data safe, and that using WATCH/MULTI/EXEC can keep your data from being corrupted by multiple clients working on the same data.
+
+# Application components in Redis
+
+## Auto Completion.
+
+This could be handled by Trie with weight.
+
+## DISTRIBUTED LOCKING
+Take care about the time out. Use Setnx and expire to get the lock and make sure the lock could expire.
+
+In order to give our lock a timeout, we’ll use EXPIRE to have Redis time it out automatically. The natural place to put the EXPIRE is immediately after the lock is acquired, and we’ll do that. 
+```java
+public String acquireLockWithTimeout(
+        Jedis conn, String lockName, long acquireTimeout, long lockTimeout)
+    {
+        String identifier = UUID.randomUUID().toString();
+        String lockKey = "lock:" + lockName;
+        int lockExpire = (int)(lockTimeout / 1000);
+
+        long end = System.currentTimeMillis() + acquireTimeout;
+        while (System.currentTimeMillis() < end) {
+            if (conn.setnx(lockKey, identifier) == 1){
+                conn.expire(lockKey, lockExpire);
+                return identifier;
+            }
+            if (conn.ttl(lockKey) == -1) {
+                conn.expire(lockKey, lockExpire);
+            }
+
+            try {
+                Thread.sleep(1);
+            }catch(InterruptedException ie){
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        // null indicates that the lock was not acquired
+        return null;
+    }
+
+
+    public boolean releaseLock(Jedis conn, String lockName, String identifier) {
+        String lockKey = "lock:" + lockName;
+
+        while (true){
+            conn.watch(lockKey);
+            if (identifier.equals(conn.get(lockKey))){
+                Transaction trans = conn.multi();
+                trans.del(lockKey);
+                List<Object> results = trans.exec();
+                if (results == null){
+                    continue;
+                }
+                return true;
+            }
+
+            conn.unwatch();
+            break;
+        }
+
+        return false;
+    }
+```
+
+ using WATCH, MULTI, and EXEC is a way of having an optimistic lock—we aren’t actually locking data, but we’re notified and our changes are canceled if someone else modifies it before we do. By adding explicit locking on the client, we get a few benefits (better performance, a more familiar programming concept, easier-to-use API, and so on), but we need to remember that Redis itself doesn’t respect our locks. It’s up to us to consistently use our locks in addition to or instead of WATCH, MULTI, and EXEC to keep our data consistent and correct.
+
+ ## COUNTING SEMAPHORES
+
+### Basic semaphore.
+
+![](./imgs/06fig06.jpg)
+
+ ```python
+def acquire_semaphore(conn, semname, limit, timeout=10):
+    identifier = str(uuid.uuid4())                             #A
+    now = time.time()
+
+    pipeline = conn.pipeline(True)
+    pipeline.zremrangebyscore(semname, '-inf', now - timeout)  #B
+    pipeline.zadd(semname, {identifier: now})                  #C
+    pipeline.zrank(semname, identifier)                        #D
+    if pipeline.execute()[-1] < limit:                         #D
+        return identifier
+
+    conn.zrem(semname, identifier)                             #E
+    return None
+# <end id="_1314_14473_8986"/>
+#A A 128-bit random identifier
+#B Time out old semaphore holders
+#C Try to acquire the semaphore
+#D Check to see if we have it
+#E We failed to get the semaphore, discard our identifier
+#END
+
+# <start id="_1314_14473_8990"/>
+def release_semaphore(conn, semname, identifier):
+    return conn.zrem(semname, identifier)                      #A
+# <end id="_1314_14473_8990"/>
+#A Returns True if the semaphore was properly released, False if it had timed out
+#END
+ ```
+
+ This basic semaphore works well—it’s simple, and it’s very fast. But relying on every process having access to the same system time in order to get the semaphore can cause problems if we have multiple hosts.
+
+## Fair semaphores
+
+In order to minimize problems with inconsistent system times, we’ll add a counter and a second ZSET.
+
+![](./imgs/06fig07.jpg)
+
+```python
+
+def acquire_fair_semaphore(conn, semname, limit, timeout=10):
+    identifier = str(uuid.uuid4())                             #A
+    czset = semname + ':owner'
+    ctr = semname + ':counter'
+
+    now = time.time()
+    pipeline = conn.pipeline(True)
+    pipeline.zremrangebyscore(semname, '-inf', now - timeout)  #B
+    pipeline.zinterstore(czset, {czset: 1, semname: 0})        #B
+
+    pipeline.incr(ctr)                                         #C
+    counter = pipeline.execute()[-1]                           #C
+
+    pipeline.zadd(semname, {identifier: now})                  #D
+    pipeline.zadd(czset, {identifier: counter})                #D
+
+    pipeline.zrank(czset, identifier)                          #E
+    if pipeline.execute()[-1] < limit:                         #E
+        return identifier                                      #F
+
+    pipeline.zrem(semname, identifier)                         #G
+    pipeline.zrem(czset, identifier)                           #G
+    pipeline.execute()
+    return None
+# <end id="_1314_14473_9004"/>
+#A A 128-bit random identifier
+#B Time out old entries
+#C Get the counter
+#D Try to acquire the semaphore
+#E Check the rank to determine if we got the semaphore
+#F We got the semaphore
+#G We didn't get the semaphore, clean out the bad data
+#END
+
+# <start id="_1314_14473_9014"/>
+def release_fair_semaphore(conn, semname, identifier):
+    pipeline = conn.pipeline(True)
+    pipeline.zrem(semname, identifier)
+    pipeline.zrem(semname + ':owner', identifier)
+    return pipeline.execute()[0]                               #A
+# <end id="_1314_14473_9014"/>
+#A Returns True if the semaphore was properly released, False if it had timed out
+#END
+
+```
+
+Let’s look at figure 6.8, which shows the sequence of operations that are performed when process ID 8372 wants to acquire the semaphore at time 1326437039.100 when there’s a limit of 5.
+
+![](./imgs/06fig08_alt.jpg)
+
+Now we have a semaphore that doesn’t require that all hosts have the same system time, though system times **do need to be within 1 or 2 seconds** in order to ensure that semaphores don’t time out too early, too late, or not at all.
+
+### Refreshing semaphores
+
+Because we already separated the timeout ZSET from the owner ZSET, we can actually refresh timeouts quickly by updating our time in the timeout ZSET, shown in the following listing.
+
+```python
+# <start id="_1314_14473_9022"/>
+def refresh_fair_semaphore(conn, semname, identifier):
+    if conn.zadd(semname, {identifier: time.time()}):          #A
+        release_fair_semaphore(conn, semname, identifier)      #B
+        return False                                           #B
+    return True                                                #C
+# <end id="_1314_14473_9022"/>
+#A Update our semaphore
+#B We lost our semaphore, report back
+#C We still have our semaphore
+#END
+```
+
+### Preventing race conditions
+
+We can see the problem in the following example. If we have two processes A and B that are trying to get one remaining semaphore, and A increments the counter first but B adds its identifier to the ZSETs and checks its identifier’s rank first, then B will get the semaphore. When A then adds its identifier and checks its rank, it’ll “steal” the semaphore from B, but B won’t know until it tries to release or renew the semaphore.
+
+To fully handle all possible race conditions for semaphores in Redis, we need to reuse the earlier distributed lock with timeouts that we built in section 6.2.5. We need to use our earlier lock to help build a correct counting semaphore. Overall, to acquire the semaphore, we’ll first try to acquire the lock for the semaphore with a short timeout. 
+
+```python
+# <start id="_1314_14473_9031"/>
+def acquire_semaphore_with_lock(conn, semname, limit, timeout=10):
+    identifier = acquire_lock(conn, semname, acquire_timeout=.01)
+    if identifier:
+        try:
+            return acquire_fair_semaphore(conn, semname, limit, timeout)
+        finally:
+            release_lock(conn, semname, identifier)
+# <end id="_1314_14473_9031"/>
+#END
+```
+
+## TASK QUEUES
+
+Right now there are many different pieces of software designed specifically for task queues (ActiveMQ, RabbitMQ, Gearman, Amazon SQS, and others), but there are also ad hoc methods of creating task queues in situations where queues aren’t expected. If you’ve ever had a cron job that scans a database table for accounts that have been modified/checked before or after a specific date/time, and you perform some operation based on the results of that query, you’ve already created a task queue.
+
+### First-in, first-out queues
+
+```python
+# <start id="_1314_14473_9056"/>
+def send_sold_email_via_queue(conn, seller, item, price, buyer):
+    data = {
+        'seller_id': seller,                    #A
+        'item_id': item,                        #A
+        'price': price,                         #A
+        'buyer_id': buyer,                      #A
+        'time': time.time()                     #A
+    }
+    conn.rpush('queue:email', json.dumps(data)) #B
+# <end id="_1314_14473_9056"/>
+#A Prepare the item
+#B Push the item onto the queue
+#END
+
+# <start id="_1314_14473_9060"/>
+def process_sold_email_queue(conn):
+    while not QUIT:
+        packed = conn.blpop(['queue:email'], 30)                  #A
+        if not packed:                                            #B
+            continue                                              #B
+
+        to_send = json.loads(packed[1])                           #C
+        try:
+            fetch_data_and_send_sold_email(to_send)               #D
+        except EmailSendError as err:
+            log_error("Failed to send sold email", err, to_send)
+        else:
+            log_success("Sent sold email", to_send)
+# <end id="_1314_14473_9060"/>
+#A Try to get a message to send using Block pop with timeout
+#B No message to send, try again
+#C Load the packed email information
+#D Send the email using our pre-written emailing function
+#END
+
+# <start id="_1314_14473_9066"/>
+def worker_watch_queue(conn, queue, callbacks):
+    while not QUIT:
+        packed = conn.blpop([queue], 30)                    #A
+        if not packed:                                      #B
+            continue                                        #B
+
+        name, args = json.loads(packed[1])                  #C
+        if name not in callbacks:                           #D
+            log_error("Unknown callback %s"%name)           #D
+            continue                                        #D
+        callbacks[name](*args)                              #E
+# <end id="_1314_14473_9066"/>
+#A Try to get an item from the queue
+#B There is nothing to work on, try again
+#C Unpack the work item
+#D The function is unknown, log the error and try again
+#E Execute the task
+#END
+```
+
+ Take the worker process in listing above: it watches the provided queue and dispatches the JSON-encoded function call to one of a set of known registered callbacks. The item to be executed will be of the form ['FUNCTION_NAME', [ARG1, ARG2, ...]].

@@ -527,3 +527,255 @@ def worker_watch_queue(conn, queue, callbacks):
 ```
 
  Take the worker process in listing above: it watches the provided queue and dispatches the JSON-encoded function call to one of a set of known registered callbacks. The item to be executed will be of the form ['FUNCTION_NAME', [ARG1, ARG2, ...]].
+
+
+* Task priorities
+
+Remember the BLPOP/BRPOP commands—we can provide multiple LISTs in which to pop an item from; the first LIST to have any items in it will have its first item popped (or last if we’re using BRPOP).
+
+```python
+# <start id="_1314_14473_9074"/>
+def worker_watch_queues(conn, queues, callbacks):   #A
+    while not QUIT:
+        packed = conn.blpop(queues, 30)             #B
+        if not packed:
+            continue
+
+        name, args = json.loads(packed[1])
+        if name not in callbacks:
+            log_error("Unknown callback %s"%name)
+            continue
+        callbacks[name](*args)
+# <end id="_1314_14473_9074"/>
+#A The first changed line to add priority support
+#B The second changed line to add priority support
+#END
+```
+
+* Delayed tasks
+
+Normally when we talk about times, we usually start talking about ZSETs. What if, for any item we wanted to execute in the future, we added it to a ZSET instead of a LIST, with its score being the time when we want it to execute? We then have a process that checks for items that should be executed now, and if there are any, the process removes it from the ZSET, adding it to the proper LIST queue.
+
+```python
+# <start id="_1314_14473_9094"/>
+def execute_later(conn, queue, name, args, delay=0):
+    identifier = str(uuid.uuid4())                          #A
+    item = json.dumps([identifier, queue, name, args])      #B
+    if delay > 0:
+        conn.zadd('delayed:', {item: time.time() + delay})  #C
+    else:
+        conn.rpush('queue:' + queue, item)                  #D
+    return identifier                                       #E
+# <end id="_1314_14473_9094"/>
+#A Generate a unique identifier
+#B Prepare the item for the queue
+#C Delay the item
+#D Execute the item immediately
+#E Return the identifier
+#END
+
+def poll_queue(conn):
+    while not QUIT:
+        item = conn.zrange('delayed:', 0, 0, withscores=True)   #A
+        if not item or item[0][1] > time.time():                #B
+            time.sleep(.01)                                     #B
+            continue                                            #B
+
+        item = item[0][0]                                       #C
+        identifier, queue, function, args = json.loads(item)    #C
+
+        locked = acquire_lock(conn, identifier)                 #D
+        if not locked:                                          #E
+            continue                                            #E
+
+        if conn.zrem('delayed:', item):                         #F
+            conn.rpush('queue:' + queue, item)                  #F
+
+        release_lock(conn, identifier, locked)                  #G
+# <end id="_1314_14473_9099"/>
+#A Get the first item in the queue
+#B No item or the item is still to be execued in the future
+#C Unpack the item so that we know where it should go
+#D Get the lock for the item
+#E We couldn't get the lock, so skip it and try again
+#F Move the item to the proper list queue
+#G Release the lock
+#END
+```
+
+
+![](./imgs/06fig10.jpg)
+
+By moving items into queues instead of executing them directly, we only need to have one or two of these running at any time (instead of as many as we have workers), so our polling overhead is kept low. The code for polling our delayed queue is in the following listing.
+
+## PULL MESSAGING
+
+### Single-recipient publish/subscribe replacement
+
+![](./imgs/06fig11.jpg)
+
+With LISTs, senders can also be notified if the recipient hasn’t been connecting recently, hasn’t received their previous messages,         or maybe has too many pending messages; all by checking the messages in the recipient’s LIST. If the system were limited by a recipient needing to be connected all the time, as is the case with PUBLISH/SUBSCRIBE, messages would get lost, clients wouldn’t know if their message got through, and slow clients could result in outgoing buffers         growing potentially without limit (in older versions of Redis) or getting disconnected (in newer versions of Redis).
+
+
+###  Multiple-recipient publish/subscribe replacement
+
+
+
+Redis PUBLISH/SUBSCRIBE is like group chat where whether someone’s connected determines whether they’re in the group chat. We want to remove that         “need to be connected all the time” requirement, and we’ll implement it in the context of chatting.
+
+![](./imgs/06fig12.jpg)
+
+As you can see, user jason22 has seen five of six chat messages sent in chat:827, in which jason22 and jeff24 are participating.
+
+The content of chat sessions themselves will be stored in ZSETs, with messages as members and message IDs as scores. 
+
+```python
+# <start id="_1314_14473_9124"/>
+def create_chat(conn, sender, recipients, message, chat_id=None):
+    chat_id = chat_id or str(conn.incr('ids:chat:'))      #A
+
+    recipients.append(sender)                             #E
+    recipientsd = dict((r, 0) for r in recipients)        #E
+
+    pipeline = conn.pipeline(True)
+    pipeline.zadd('chat:' + chat_id, recipientsd)         #B
+    for rec in recipients:                                #C
+        pipeline.zadd('seen:' + rec, {chat_id: 0})        #C
+    pipeline.execute()
+
+    return send_message(conn, chat_id, sender, message)   #D
+# <end id="_1314_14473_9124"/>
+#A Get a new chat id
+#E Set up a dictionary of users to scores to add to the chat ZSET
+#B Create the set with the list of people participating
+#C Initialize the seen zsets
+#D Send the message
+#END
+
+# <start id="_1314_14473_9127"/>
+def send_message(conn, chat_id, sender, message):
+    identifier = acquire_lock(conn, 'chat:' + chat_id)
+    if not identifier:
+        raise Exception("Couldn't get the lock")
+    try:
+        mid = conn.incr('ids:' + chat_id)                #A
+        ts = time.time()                                 #A
+        packed = json.dumps({                            #A
+            'id': mid,                                   #A
+            'ts': ts,                                    #A
+            'sender': sender,                            #A
+            'message': message,                          #A
+        })                                               #A
+
+        conn.zadd('msgs:' + chat_id, {packed: mid})      #B
+    finally:
+        release_lock(conn, 'chat:' + chat_id, identifier)
+    return chat_id
+# <end id="_1314_14473_9127"/>
+#A Prepare the message
+#B Send the message to the chat
+#END
+
+```
+
+
+Generally, when we use a value from Redis in the construction of another value we need to add to Redis, we’ll either need to use a WATCH/MULTI/EXEC transaction or a lock to remove race conditions. We use a lock here for the same performance reasons that we developed it in the first place.
+
+
+To fetch all pending messages for a user, we need to fetch group IDs and message IDs seen from the user’s ZSET with ZRANGE. When we have the group IDs and the messages that the user has seen, we can perform ZRANGEBYSCORE operations on all of the message ZSETs. After we’ve fetched the messages for the chat, we update the seen ZSET with the proper ID and the user entry in the group ZSET, and we go ahead and clean out any messages from the group chat that have been received by everyone in the chat, as shown         in the following listing.
+
+```python
+# <start id="_1314_14473_9132"/>
+def fetch_pending_messages(conn, recipient):
+    seen = conn.zrange('seen:' + recipient, 0, -1, withscores=True) #A
+
+    pipeline = conn.pipeline(True)
+
+    for chat_id, seen_id in seen:                               #B
+        pipeline.zrangebyscore(                                 #B
+            b'msgs:' + chat_id, seen_id+1, 'inf')                #B
+    chat_info = list(zip(seen, pipeline.execute()))                   #C
+
+    for i, ((chat_id, seen_id), messages) in enumerate(chat_info):
+        if not messages:
+            continue
+        messages[:] = list(map(json.loads, messages))
+        seen_id = messages[-1]['id']                            #D
+        conn.zadd(b'chat:' + chat_id, {recipient: seen_id})      #D
+
+        min_id = conn.zrange(                                   #E
+            b'chat:' + chat_id, 0, 0, withscores=True)           #E
+
+        pipeline.zadd('seen:' + recipient, {chat_id: seen_id})  #F
+        if min_id:
+            pipeline.zremrangebyscore(                          #G
+                b'msgs:' + chat_id, 0, min_id[0][1])             #G
+        chat_info[i] = (chat_id, messages)
+    pipeline.execute()
+
+    return chat_info
+# <end id="_1314_14473_9132"/>
+#A Get the last message ids received
+#B Fetch all new messages
+#C Prepare information about the data to be returned
+#D Update the 'chat' ZSET with the most recently received message
+#E Discover messages that have been seen by all users
+#F Update the 'seen' ZSET
+#G Clean out messages that have been seen by all users
+#END
+```
+
+* Joining and leaving the chat
+```python
+# <start id="_1314_14473_9135"/>
+def join_chat(conn, chat_id, user):
+    message_id = int(conn.get('ids:' + chat_id))                #A
+
+    pipeline = conn.pipeline(True)
+    pipeline.zadd('chat:' + chat_id, {user: message_id})          #B
+    pipeline.zadd('seen:' + user, {chat_id: message_id})          #C
+    pipeline.execute()
+# <end id="_1314_14473_9135"/>
+#A Get the most recent message id for the chat
+#B Add the user to the chat member list
+#C Add the chat to the users's seen list
+#END
+
+# <start id="_1314_14473_9136"/>
+def leave_chat(conn, chat_id, user):
+    pipeline = conn.pipeline(True)
+    pipeline.zrem('chat:' + chat_id, user)                      #A
+    pipeline.zrem('seen:' + user, chat_id)                      #A
+    pipeline.zcard('chat:' + chat_id)                           #B
+
+    if not pipeline.execute()[-1]:
+        pipeline.delete('msgs:' + chat_id)                      #C
+        pipeline.delete('ids:' + chat_id)                       #C
+        pipeline.execute()
+    else:
+        oldest = conn.zrange(                                   #D
+            'chat:' + chat_id, 0, 0, withscores=True)           #D
+        conn.zremrangebyscore('msgs:' + chat_id, 0, oldest[0][1])     #E
+# <end id="_1314_14473_9136"/>
+#A Remove the user from the chat
+#B Find the number of remaining group members
+#C Delete the chat
+#D Find the oldest message seen by all users
+#E Delete old messages from the chat
+#END
+
+```
+We now have a multiple-recipient messaging system to replace PUBLISH and SUBSCRIBE for group chat.
+
+## DISTRIBUTING FILES WITH REDIS
+
+Usually we don't distribute logs via redis, please use kafka to distribute the logs.
+
+## SUMMARY
+
+If there’s one concept that you should take away from this entire chapter, it’s that although WATCH is a useful command, is built in, convenient, and so forth, having access to a working distributed lock implementation from section 6.2 can make concurrent Redis programming so much easier. Being able to lock at a finer level of detail than an entire key can reduce contention, and being able to lock around related operations can reduce operation complexity. We saw both performance improvements and operation simplicity in our revisited marketplace example from section 4.6, and in our delayed task queue from section 6.4.2.
+
+If there’s a second concept that you should remember, take to heart, and apply in the future, it’s that with a little work, you can build reusable components with Redis. We reused locks explicitly in counting semaphores, delayed task queues, and in our multiple-recipient pub/sub replacement. And we reused our multiple-recipient pub/sub replacement when we distributed files with Redis.
+
+
+# Search-based applications

@@ -12,6 +12,7 @@ docker start myredis
 ```
 
 # Chapter 2 and 3
+
 1. It is better to debug the code in eclipse, because some backgroud thread may clean the data during the runtime. To debug, you could track the data change in the redis.
 2. Check out the code comments to find out more about how to handle big amount of data.
 3. In Redis, when we talk about a group of commands as being atomic, we mean that no other client can read or change data while we’re reading or changing that same data.
@@ -779,3 +780,553 @@ If there’s a second concept that you should remember, take to heart, and apply
 
 
 # Search-based applications
+
+## SEARCHING IN REDIS
+
+This preprocessing step is generally known as indexing, and the structures that we create are called inverted indexes. In the search world, inverted indexes are well known and are the underlying structure for almost every search engine that we’ve used on the internet.
+
+![](./imgs/07fig01_alt.jpg)
+
+
+The process of tokenizing text into words
+
+![](./imgs/07fig02.jpg)
+
+Sometimes we want to search for items with similar meanings and have them considered the same, which we call synonyms (at least in this context). To handle that situation, we could again fetch all of the document SETs for those words and find all of the unique documents, or we could use another built-in Redis operation: SUNION or SUNIONSTORE.
+
+
+With Redis SET operations and a bit of helper code, we can perform arbitrarily intricate word queries over our documents. Listing 7.2 provides a group of helper functions that will perform SET intersections, unions, and differences over the given words, storing them in temporary SETs with an expiration time that defaults to 30 seconds.
+
+```python
+# <start id="_1314_14473_9158"/>
+def _set_common(conn, method, names, ttl=30, execute=True):
+    id = str(uuid.uuid4())                                  #A
+    pipeline = conn.pipeline(True) if execute else conn     #B
+    names = ['idx:' + name for name in names]               #C
+    getattr(pipeline, method)('idx:' + id, *names)          #D
+    pipeline.expire('idx:' + id, ttl)                       #E
+    if execute:
+        pipeline.execute()                                  #F
+    return id                                               #G
+
+def intersect(conn, items, ttl=30, _execute=True):          #H
+    return _set_common(conn, 'sinterstore', items, ttl, _execute) #H
+
+def union(conn, items, ttl=30, _execute=True):                    #I
+    return _set_common(conn, 'sunionstore', items, ttl, _execute) #I
+
+def difference(conn, items, ttl=30, _execute=True):               #J
+    return _set_common(conn, 'sdiffstore', items, ttl, _execute)  #J
+# <end id="_1314_14473_9158"/>
+#A Create a new temporary identifier
+#B Set up a transactional pipeline so that we have consistent results for each individual call
+#C Add the 'idx:' prefix to our terms
+#D Set up the call for one of the operations
+#E Instruct Redis to expire the SET in the future
+#F Actually execute the operation
+#G Return the id for the caller to process the results
+#H Helper function to perform SET intersections
+#I Helper function to perform SET unions
+#J Helper function to perform SET differences
+#END
+```
+
+Each of the intersect(), union(), and difference() functions calls another helper function that actually does all of the heavy lifting. This is because they all essentially do the same thing: set up the keys, make the appropriate SET call, update the expiration, and return the new SET’s ID. 
+
+Putting it all together where + denotes synonyms and - denotes unwanted words
+
+```python
+# <start id="parse-query"/>
+QUERY_RE = re.compile("[+-]?[a-z']{2,}")                #A
+
+def parse(query):
+    unwanted = set()                                    #B
+    all = []                                            #C
+    current = set()                                     #D
+    for match in QUERY_RE.finditer(query.lower()):      #E
+        word = match.group()                            #F
+        prefix = word[:1]                               #F
+        if prefix in '+-':                              #F
+            word = word[1:]                             #F
+        else:                                           #F
+            prefix = None                               #F
+
+        word = word.strip("'")                          #G
+        if len(word) < 2 or word in STOP_WORDS:         #G
+            continue                                    #G
+
+        if prefix == '-':                               #H
+            unwanted.add(word)                          #H
+            continue                                    #H
+
+        if current and not prefix:                      #I
+            all.append(list(current))                   #I
+            current = set()                             #I
+        current.add(word)                               #J
+
+    if current:                                         #K
+        all.append(list(current))                       #K
+
+    return all, list(unwanted)                          #L
+# <end id="parse-query"/>
+#A Our regular expression for finding wanted, unwanted, and synonym words
+#B A unique set of unwanted words
+#C Our final result of words that we are looking to intersect
+#D The current unique set of words to consider as synonyms
+#E Iterate over all words in the search query
+#F Discover +/- prefixes, if any
+#G Strip any leading or trailing single quotes, and skip anything that is a stop word
+#H If the word is unwanted, add it to the unwanted set
+#I Set up a new synonym set if we have no synonym prefix and we already have words
+#J Add the current word to the current set
+#K Add any remaining words to the final intersection
+#END
+
+# <start id="search-query"/>
+def parse_and_search(conn, query, ttl=30):
+    all, unwanted = parse(query)                                    #A
+    if not all:                                                     #B
+        return None                                                 #B
+
+    to_intersect = []
+    for syn in all:                                                 #D
+        if len(syn) > 1:                                            #E
+            to_intersect.append(union(conn, syn, ttl=ttl))          #E
+        else:                                                       #F
+            to_intersect.append(syn[0])                             #F
+
+    if len(to_intersect) > 1:                                       #G
+        intersect_result = intersect(conn, to_intersect, ttl=ttl)   #G
+    else:                                                           #H
+        intersect_result = to_intersect[0]                          #H
+
+    if unwanted:                                                    #I
+        unwanted.insert(0, intersect_result)                        #I
+        return difference(conn, unwanted, ttl=ttl)                  #I
+
+    return intersect_result                                         #J
+# <end id="search-query"/>
+#A Parse the query
+#B If there are no words in the query that are not stop words, we don't have a result
+#D Iterate over each list of synonyms
+#E If the synonym list is more than one word long, then perform the union operation
+#F Otherwise use the individual word directly
+#G If we have more than one word/result to intersect, intersect them
+#H Otherwise use the individual word/result directly
+#I If we have any unwanted words, remove them from our earlier result and return it
+#J Otherwise return the intersection result
+#END
+```
+
+## SORTED INDEXES
+
+we used a helper function for handling the creation of a temporary ID, the ZINTERSTORE call, and setting the expiration time of the result ZSET. The zintersect() and zunion() helper functions are shown next.
+
+```python
+# <start id="zset_scored_composite"/>
+def search_and_zsort(conn, query, id=None, ttl=300, update=1, vote=0,   #A
+                    start=0, num=20, desc=True):                        #A
+
+    if id and not conn.expire(id, ttl):     #B
+        id = None                           #B
+
+    if not id:                                      #C
+        id = parse_and_search(conn, query, ttl=ttl) #C
+
+        scored_search = {
+            id: 0,                                  #I
+            'sort:update': update,                  #D
+            'sort:votes': vote                      #D
+        }
+        id = zintersect(conn, scored_search, ttl)   #E
+
+    pipeline = conn.pipeline(True)
+    pipeline.zcard('idx:' + id)                                     #F
+    if desc:                                                        #G
+        pipeline.zrevrange('idx:' + id, start, start + num - 1)     #G
+    else:                                                           #G
+        pipeline.zrange('idx:' + id, start, start + num - 1)        #G
+    results = pipeline.execute()
+
+    return results[0], results[1], id                               #H
+# <end id="zset_scored_composite"/>
+#A Like before, we'll optionally take a previous result id for pagination if the result is still available
+#B We will refresh the search result's TTL if possible
+#C If our search result expired, or if this is the first time we've searched, perform the standard SET search
+#I We use the 'id' key for the intersection, but we don't want it to count towards weights
+#D Set up the scoring adjustments for balancing update time and votes. Remember: votes can be adjusted to 1, 10, 100, or higher depending on the sorting result desired.
+#E Intersect using our helper function that we define in listing 7.7
+#F Fetch the size of the result ZSET
+#G Handle fetching a "page" of results
+#H Return the results and the id for pagination
+#END
+
+
+# <start id="zset_helpers"/>
+def _zset_common(conn, method, scores, ttl=30, **kw):
+    id = str(uuid.uuid4())                                  #A
+    execute = kw.pop('_execute', True)                      #J
+    pipeline = conn.pipeline(True) if execute else conn     #B
+    for key in list(scores.keys()):                               #C
+        scores['idx:' + key] = scores.pop(key)              #C
+    getattr(pipeline, method)('idx:' + id, scores, **kw)    #D
+    pipeline.expire('idx:' + id, ttl)                       #E
+    if execute:                                             #F
+        pipeline.execute()                                  #F
+    return id                                               #G
+
+def zintersect(conn, items, ttl=30, **kw):                              #H
+    return _zset_common(conn, 'zinterstore', dict(items), ttl, **kw)    #H
+
+def zunion(conn, items, ttl=30, **kw):                                  #I
+    return _zset_common(conn, 'zunionstore', dict(items), ttl, **kw)    #I
+# <end id="zset_helpers"/>
+#A Create a new temporary identifier
+#B Set up a transactional pipeline so that we have consistent results for each individual call
+#C Add the 'idx:' prefix to our inputs
+#D Set up the call for one of the operations
+#E Instruct Redis to expire the ZSET in the future
+#F Actually execute the operation, unless explicitly instructed not to by the caller
+#G Return the id for the caller to process the results
+#H Helper function to perform ZSET intersections
+#I Helper function to perform ZSET unions
+#J Allow the passing of an argument to determine whether we should defer pipeline execution
+#END
+```
+
+## AD TARGETING
+
+**Please read the article**, pay attention to the function intersect(), union(), and difference(), zintersect and zunion. They will create intermediem set which could be use in further processing. Also the parameter in json is tricky. Look at below example, matched_ads is variable and *'ad:value:'* is a string.
+
+```python
+# <start id="location_target"/>
+def match_location(pipe, locations):
+    required = ['req:' + loc for loc in locations]                  #A
+    matched_ads = union(pipe, required, ttl=300, _execute=False)    #B
+    return matched_ads, zintersect(pipe,                            #C
+        {matched_ads: 0, 'ad:value:': 1}, _execute=False)  #C
+# <end id="location_target"/>
+#A Calculate the SET key names for all of the provided locations
+#B Calculate the SET of matched ads that are valid for this location
+#C Return the matched ads SET id, as well as the id of the ZSET that includes the base eCPM of all of the matched ads
+#END
+```
+
+## JOB SEARCH
+
+ Start with every job having its own SET, with members being the skills that the job requires. To check whether a candidate has all of the requirements for a given job, we’d add the candidate’s skills to a SET and then perform the SDIFF of the job and the candidate’s skills.
+
+ ```python
+# <start id="slow_job_search"/>
+def add_job(conn, job_id, required_skills):
+    conn.sadd('job:' + job_id, *required_skills)        #A
+
+def is_qualified(conn, job_id, candidate_skills):
+    temp = str(uuid.uuid4())
+    pipeline = conn.pipeline(True)
+    pipeline.sadd(temp, *candidate_skills)              #B
+    pipeline.expire(temp, 5)                            #B
+    pipeline.sdiff('job:' + job_id, temp)               #C
+    return not pipeline.execute()[-1]                   #D
+# <end id="slow_job_search"/>
+#A Add all required job skills to the job's SET
+#B Add the candidate's skills to a temporary SET with an expiration time
+#C Calculate the SET of skills that the job requires that the user doesn't have
+#D Return True if there are no skills that the candidate does not have
+#END
+ ```
+but it suffers from the fact that to find all of the jobs for a given candidate, we must check each job individually. This won’t scale, but there are solutions that will.
+
+### Approaching the problem like search
+
+Rather than talk about jobs with skills, we need to flip the problem around like we did with the other search problems described in this chapter. We start with one SET per skill, which stores all of the jobs that require that skill. In a required skills ZSET, we store the total number of skills that a job requires. The code that sets up our index looks like the next listing.
+
+To perform a search for jobs that a candidate has all of the skills for, we need to approach the search like we did with the         bonuses to ad targeting in section 7.3.3. More specifically, we’ll perform a ZUNIONSTORE operation over skill SETs to calculate a total score for each job. This score represents how many skills the candidate has for each of the jobs.
+
+```python
+
+# <start id="job_search_index"/>
+def index_job(conn, job_id, skills):
+    pipeline = conn.pipeline(True)
+    for skill in skills:
+        pipeline.sadd('idx:skill:' + skill, job_id)             #A
+    pipeline.zadd('idx:jobs:req', {job_id: len(set(skills))})   #B
+    pipeline.execute()
+# <end id="job_search_index"/>
+#A Add the job id to all appropriate skill SETs
+#B Add the total required skill count to the required skills ZSET
+#END
+
+# <start id="job_search_results"/>
+def find_jobs(conn, candidate_skills):
+    skills = {}                                                 #A
+    for skill in set(candidate_skills):                         #A
+        skills['skill:' + skill] = 1                            #A
+
+    job_scores = zunion(conn, skills)                           #B
+    final_result = zintersect(                                  #C
+        conn, {job_scores:-1, 'jobs:req':1})                    #C
+
+    return conn.zrangebyscore('idx:' + final_result, 0, 0)      #D
+# <end id="job_search_results"/>
+#A Set up the dictionary for scoring the jobs
+#B Calculate the scores for each of the jobs
+#C Calculate how many more skills the job requires than the candidate has
+#D Return the jobs that the candidate has the skills for
+#END
+
+```
+
+Again, we first find the scores for each job. After we have the scores for each job, we subtract each job score from the total         score necessary to match. In that final result, any job with a ZSET score of 0 is a job that the candidate has all of the skills for.
+
+Depending on the number of jobs and searches that are being performed, our job-search system may or may not perform as fast         as we need it to, especially with large numbers of jobs or searches. But if we apply sharding techniques that we’ll discuss in chapter 9, we can break the large calculations into smaller pieces and calculate partial results bit by bit. Alternatively, if we first find the SET of jobs in a location to search for jobs, we could perform the same kind of optimization that we performed with ad targeting in section 7.3.3, which could greatly improve job-search performance.
+
+More examples, to search job levels or years of experience
+
+```python
+# 0 is beginner, 1 is intermediate, 2 is expert
+SKILL_LEVEL_LIMIT = 2
+
+def index_job_levels(conn, job_id, skill_levels):
+    total_skills = len(set(skill for skill, level in skill_levels))
+    pipeline = conn.pipeline(True)
+    for skill, level in skill_levels:
+        level = min(level, SKILL_LEVEL_LIMIT)
+        for wlevel in range(level, SKILL_LEVEL_LIMIT+1):  ## add all the levels equal or greater than the required level.
+            pipeline.sadd('idx:skill:%s:%s'%(skill,wlevel), job_id)
+    pipeline.zadd('idx:jobs:req', {job_id: total_skills})  ## count is the same
+    pipeline.execute()
+
+def search_job_levels(conn, skill_levels):
+    skills = {}
+    for skill, level in skill_levels:
+        level = min(level, SKILL_LEVEL_LIMIT)
+        skills['skill:%s:%s'%(skill,level)] = 1
+
+    job_scores = zunion(conn, skills)
+    final_result = zintersect(conn, {job_scores:-1, 'jobs:req':1})
+
+    return conn.zrangebyscore('idx:' + final_result, '-inf', 0) # get from - infinite to 0
+
+
+def index_job_years(conn, job_id, skill_years):
+    total_skills = len(set(skill for skill, years in skill_years))
+    pipeline = conn.pipeline(True)
+    for skill, years in skill_years:
+        pipeline.zadd(
+            'idx:skill:%s:years'%skill, {job_id:max(years, 0)})
+    pipeline.sadd('idx:jobs:all', job_id)
+    pipeline.zadd('idx:jobs:req', {job_id:total_skills})
+    pipeline.execute()
+
+def search_job_years(conn, skill_years):
+    skill_years = dict(skill_years)
+    pipeline = conn.pipeline(True)
+
+    union = []
+    for skill, years in skill_years.items():
+        sub_result = zintersect(pipeline,
+            {'jobs:all':-years, 'skill:%s:years'%skill:1}, _execute=False) #减去当前有的years，如果当前years超过了要求，结果就会是负的
+        pipeline.zremrangebyscore('idx:' + sub_result, '(0', 'inf')# Delete all the positive job with positive skills
+        union.append(
+            zintersect(pipeline, {'jobs:all':1, sub_result:0}, _execute=False)) # union the negative result together, now we have all the skill count required like the first example.
+
+    job_scores = zunion(pipeline, dict((key, 1) for key in union), _execute=False)
+    final_result = zintersect(pipeline, {job_scores:-1, 'jobs:req':1}, _execute=False)
+
+    pipeline.zrangebyscore('idx:' + final_result, '-inf', 0)
+    return pipeline.execute()[-1]
+
+```
+
+# Building a simple social network
+
+## USERS AND STATUSES
+
+### User information
+
+![](./imgs/08fig01.jpg)
+
+Create a user in hash
+
+```python
+# <start id="create-twitter-user"/>
+def create_user(conn, login, name):
+    llogin = login.lower()
+    lock = acquire_lock_with_timeout(conn, 'user:' + llogin, 1) #A
+    if not lock:                            #B
+        return None                         #B
+
+    if conn.hget('users:', llogin):         #C
+        release_lock(conn, 'user:' + llogin, lock)  #C
+        return None                         #C
+
+    id = conn.incr('user:id:')              #D
+    pipeline = conn.pipeline(True)
+    pipeline.hset('users:', llogin, id)     #E
+    pipeline.hmset('user:%s'%id, {          #F
+        'login': login,                     #F
+        'id': id,                           #F
+        'name': name,                       #F
+        'followers': 0,                     #F
+        'following': 0,                     #F
+        'posts': 0,                         #F
+        'signup': time.time(),              #F
+    })
+    pipeline.execute()
+    release_lock(conn, 'user:' + llogin, lock)  #G
+    return id                               #H
+# <end id="create-twitter-user"/>
+#A Try to acquire the lock for the lowercased version of the login name. This function is defined in chapter 6
+#B If we couldn't get the lock, then someone else already has the same login name
+#C We also store a HASH of lowercased login names to user ids, so if there is already a login name that maps to an ID, we know and won't give it to a second person
+#D Each user is given a unique id, generated by incrementing a counter
+#E Add the lowercased login name to the HASH that maps from login names to user ids
+#F Add the user information to the user's HASH
+#G Release the lock over the login name
+#H Return the id of the user
+#END
+```
+This lock is necessary: it guarantees that we won’t have two requests trying to create a user with the same login at the same time.
+
+### Status messages
+
+As was the case with user information, we’ll store status message information inside a HASH.
+
+![](./imgs/08fig02.jpg)
+
+```python
+# <start id="create-twitter-status"/>
+def create_status(conn, uid, message, **data):
+    pipeline = conn.pipeline(True)
+    pipeline.hget('user:%s'%uid, 'login')   #A
+    pipeline.incr('status:id:')             #B
+    login, id = pipeline.execute()
+
+    if not login:                           #C
+        return None                         #C
+
+    data.update({
+        'message': message,                 #D
+        'posted': time.time(),              #D
+        'id': id,                           #D
+        'uid': uid,                         #D
+        'login': login,                     #D
+    })
+    pipeline.hmset('status:%s'%id, data)    #D
+    pipeline.hincrby('user:%s'%uid, 'posts')#E
+    pipeline.execute()
+    return id                               #F
+# <end id="create-twitter-status"/>
+#A Get the user's login name from their user id
+#B Create a new id for the status message
+#C Verify that we have a proper user account before posting
+#D Prepare and set the data for the status message
+#E Record the fact that a status message has been posted
+#F Return the id of the newly created status message
+#END
+```
+
+## HOME TIMELINE
+
+For the home timeline, which will store the list of status messages that have been posted by the people that the current user is following, we’ll use a ZSET to store status IDs as ZSET members, with the timestamp of when the message was posted being used as the score.
+
+![](./imgs/08fig03.jpg)
+
+```python
+# <start id="fetch-page"/>
+def get_status_messages(conn, uid, timeline='home:', page=1, count=30):#A
+    statuses = conn.zrevrange(                                  #B
+        '%s%s'%(timeline, uid), (page-1)*count, page*count-1)   #B
+
+    pipeline = conn.pipeline(True)
+    for id in statuses:                                         #C
+        pipeline.hgetall('status:%s'%(to_str(id),))             #C
+
+    return [_f for _f in pipeline.execute() if _f]                     #D
+# <end id="fetch-page"/>
+#A We will take an optional 'timeline' argument, as well as page size and status message counts
+#B Fetch the most recent status ids in the timeline
+#C Actually fetch the status messages themselves
+#D Filter will remove any 'missing' status messages that had been previously deleted
+#END
+```
+
+## FOLLOWERS/FOLLOWING LISTS
+
+To keep a list of followers and a list of those people that a user is following, we’ll also store user IDs and timestamps in ZSETs as well, with members being user IDs, and scores being the timestamp of when the user was followed.
+
+![](./imgs/08fig04_alt.jpg)
+
+
+```python
+# <start id="follow-user"/>
+HOME_TIMELINE_SIZE = 1000
+def follow_user(conn, uid, other_uid):
+    fkey1 = 'following:%s'%uid          #A
+    fkey2 = 'followers:%s'%other_uid    #A
+
+    if conn.zscore(fkey1, other_uid):   #B
+        return None                     #B
+
+    now = time.time()
+
+    pipeline = conn.pipeline(True)
+    pipeline.zadd(fkey1, {other_uid: now})    #C
+    pipeline.zadd(fkey2, {uid: now})          #C
+    pipeline.zrevrange('profile:%s'%other_uid,      #E
+        0, HOME_TIMELINE_SIZE-1, withscores=True)   #E
+    following, followers, status_and_score = pipeline.execute()[-3:]
+
+    pipeline.hincrby('user:%s'%uid, 'following', int(following))        #F
+    pipeline.hincrby('user:%s'%other_uid, 'followers', int(followers))  #F
+    if status_and_score:
+        pipeline.zadd('home:%s'%uid, dict(status_and_score))  #G
+    pipeline.zremrangebyrank('home:%s'%uid, 0, -HOME_TIMELINE_SIZE-1)#G
+
+    pipeline.execute()
+    return True                         #H
+# <end id="follow-user"/>
+#A Cache the following and followers key names
+#B If the other_uid is already being followed, return
+#C Add the uids to the proper following and followers ZSETs
+#E Fetch the most recent HOME_TIMELINE_SIZE status messages from the newly followed user's profile timeline
+#F Update the known size of the following and followers ZSETs in each user's HASH
+#G Update the home timeline of the following user, keeping only the most recent 1000 status messages
+#H Return that the user was correctly followed
+#END
+
+# <start id="unfollow-user"/>
+def unfollow_user(conn, uid, other_uid):
+    fkey1 = 'following:%s'%uid          #A
+    fkey2 = 'followers:%s'%other_uid    #A
+
+    if not conn.zscore(fkey1, other_uid):   #B
+        return None                         #B
+
+    pipeline = conn.pipeline(True)
+    pipeline.zrem(fkey1, other_uid)                 #C
+    pipeline.zrem(fkey2, uid)                       #C
+    pipeline.zrevrange('profile:%s'%other_uid,      #E
+        0, HOME_TIMELINE_SIZE-1)                    #E
+    following, followers, statuses = pipeline.execute()[-3:]
+
+    pipeline.hincrby('user:%s'%uid, 'following', -int(following))        #F
+    pipeline.hincrby('user:%s'%other_uid, 'followers', -int(followers))  #F
+    if statuses:
+        pipeline.zrem('home:%s'%uid, *statuses)                 #G
+
+    pipeline.execute()
+    return True                         #H
+# <end id="unfollow-user"/>
+#A Cache the following and followers key names
+#B If the other_uid is not being followed, return
+#C Remove the uids the proper following and followers ZSETs
+#E Fetch the most recent HOME_TIMELINE_SIZE status messages from the user that we stopped following
+#F Update the known size of the following and followers ZSETs in each user's HASH
+#G Update the home timeline, removing any status messages from the previously followed user
+#H Return that the unfollow executed successfully
+#END
+```
+
+## POSTING OR DELETING A STATUS UPDATE

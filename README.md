@@ -1330,3 +1330,466 @@ def unfollow_user(conn, uid, other_uid):
 ```
 
 ## POSTING OR DELETING A STATUS UPDATE
+
+To allow for our call to return quickly, we’ll do two things. First, we’ll add the status ID to the home timelines of the         first 1,000 followers as part of the call that posts the status message. Based on statistics from a site like Twitter, that         should handle at least 99.9% of all users who post (Twitter-wide analytics suggest that there are roughly 100,000–250,000         users with more than 1,000 followers, which amounts to roughly .1% of the active user base). This means that only the top         .1% of users will need another step.                  Second, for those users with more than 1,000 followers, we’ll start a deferred task using a system similar to what we built         back in section 6.4. The next listing shows the code for pushing status updates to followers.
+
+```python
+# <start id="post-message"/>
+def post_status(conn, uid, message, **data):
+    id = create_status(conn, uid, message, **data)  #A
+    if not id:              #B
+        return None         #B
+
+    posted = conn.hget('status:%s'%id, 'posted')    #C
+    if not posted:                                  #D
+        return None                                 #D
+
+    post = {str(id): float(posted)}
+    conn.zadd('profile:%s'%uid, post)               #E
+
+    syndicate_status(conn, uid, post)         #F
+    return id
+# <end id="post-message"/>
+#A Create a status message using the earlier function
+#B If the creation failed, return
+#C Get the time that the message was posted
+#D If the post wasn't found, return
+#E Add the status message to the user's profile timeline
+#F Actually push the status message out to the followers of the user
+#END
+
+# <start id="syndicate-message"/>
+POSTS_PER_PASS = 1000           #A
+def syndicate_status(conn, uid, post, start=0):
+    followers = conn.zrangebyscore('followers:%s'%uid, start, 'inf',#B
+        start=0, num=POSTS_PER_PASS, withscores=True)   #B
+
+    pipeline = conn.pipeline(False)
+    for follower, start in followers:                    #E
+        follower = to_str(follower)
+        pipeline.zadd('home:%s'%follower, post)          #C
+        pipeline.zremrangebyrank(                        #C
+            'home:%s'%follower, 0, -HOME_TIMELINE_SIZE-1)#C
+    pipeline.execute()
+
+    if len(followers) >= POSTS_PER_PASS:                    #D
+        execute_later(conn, 'default', 'syndicate_status',  #D
+            [conn, uid, post, start])                       #D
+# <end id="syndicate-message"/>
+#A Only send to 1000 users per pass
+#B Fetch the next group of 1000 followers, starting at the last person to be updated last time
+#E Iterating through the followers results will update the 'start' variable, which we can later pass on to subsequent syndicate_status() calls
+#C Add the status to the home timelines of all of the fetched followers, and trim the home timelines so they don't get too big
+#D If at least 1000 followers had received an update, execute the remaining updates in a task
+#END
+```
+
+This second function is what actually handles pushing status messages to the first 1,000 followers’ home timelines, and starts         a delayed task using the API we defined in section 6.4 for followers past the first 1,000. With those new functions, we’ve now completed the tools necessary to actually post a         status update and send it to all of a user’s followers.
+
+It turns out that deleting a status message is pretty easy. Before returning the fetched status messages from a user’s home or profile timeline in get_messages(), we’re already filtering “empty” status messages with the Python filter() function. 
+
+```python
+# <start id="delete-message"/>
+def delete_status(conn, uid, status_id):
+    status_id = to_str(status_id)
+    key = 'status:%s'%status_id
+    lock = acquire_lock_with_timeout(conn, key, 1)  #A
+    if not lock:                #B
+        return None             #B
+
+    if conn.hget(key, 'uid') != to_bytes(uid): #C
+        release_lock(conn, key, lock)       #C
+        return None                         #C
+
+    uid = to_str(uid)
+    pipeline = conn.pipeline(True)
+    pipeline.delete(key)                            #D
+    pipeline.zrem('profile:%s'%uid, status_id)      #E
+    pipeline.zrem('home:%s'%uid, status_id)         #F
+    pipeline.hincrby('user:%s'%uid, 'posts', -1)    #G
+    pipeline.execute()
+
+    release_lock(conn, key, lock)
+    return True
+# <end id="delete-message"/>
+#A Acquire a lock around the status object to ensure that no one else is trying to delete it when we are
+#B If we didn't get the lock, return
+#C If the user doesn't match the user stored in the status message, return
+#D Delete the status message
+#E Remove the status message id from the user's profile timeline
+#F Remove the status message id from the user's home timeline
+#G Reduce the number of posted messages in the user information HASH
+#END
+```
+
+While deleting the status message and updating the status count, we also went ahead and removed the message from the user’s home timeline and profile timeline. Though this isn’t technically necessary, it does allow us to keep both of those timelines a little cleaner without much effort.
+
+# Reducing memory use
+
+By reducing the amount of memory you use in Redis, you can reduce the time it takes to create or load a snapshot, rewrite or load an append-only file, reduce slave synchronization time,[1] and store more data in Redis without additional hardware.
+
+Our use of sharding here is primarily driven to reduce memory use on a single server. In chapter 10, we’ll apply similar techniques to allow for increased read throughput, write throughput, and memory partitioning across multiple Redis servers.
+
+
+## SHORT STRUCTURES
+
+For LISTs, SETs, HASHes, and ZSETs, Redis offers a group of configuration options that allows for Redis to store short structures in a more space-efficient manner.
+
+When using short LISTs, HASHes, and ZSETs, Redis can optionally store them using a more compact storage method known as a ziplist. A **ziplist** is an unstructured representation of one of the three types of objects. Rather than storing the **doubly linked list, the hash table, or the hash table plus the skiplist** as would normally be the case for each of these structures, Redis stores a serialized version of the data, which must be decoded for every read, partially re-encoded for every write, and may require moving data around in memory.
+
+ LIST. In a typical doubly linked list, we have structures called nodes, which represent each value in the list.
+
+![](./imgs/09fig01_alt.jpg)
+
+the ziplist representation will store a sequence of length, length, string elements. The first length is the size of the previous entry (for easy scanning in both directions), the second length is the size of the current entry, and the string is the stored data itself. There are some other details about what these lengths really mean in practice, but for these three example strings, the lengths will be 1 byte long, for 2 bytes of overhead per entry in this example. 
+
+https://scalegrid.io/blog/introduction-to-redis-data-structures-hashes/
+
+![](./imgs/211fig01_alt.jpg)
+
+```python
+# <start id="ziplist-test"/>
+>>> conn.rpush('test', 'a', 'b', 'c', 'd')  #A
+4                                           #A
+>>> conn.debug_object('test')                                       #B
+{'encoding': 'ziplist', 'refcount': 1, 'lru_seconds_idle': 20,      #C
+'lru': 274841, 'at': '0xb6c9f120', 'serializedlength': 24,          #C
+'type': 'Value'}                                                    #C
+>>> conn.rpush('test', 'e', 'f', 'g', 'h')  #D
+8                                           #D
+>>> conn.debug_object('test')
+{'encoding': 'ziplist', 'refcount': 1, 'lru_seconds_idle': 0,   #E
+'lru': 274846, 'at': '0xb6c9f120', 'serializedlength': 36,      #E
+'type': 'Value'}
+>>> conn.rpush('test', 65*'a')          #F
+9
+>>> conn.debug_object('test')
+{'encoding': 'linkedlist', 'refcount': 1, 'lru_seconds_idle': 10,   #F
+'lru': 274851, 'at': '0xb6c9f120', 'serializedlength': 30,          #G
+'type': 'Value'}
+>>> conn.rpop('test')                                               #H
+'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+>>> conn.debug_object('test')
+{'encoding': 'linkedlist', 'refcount': 1, 'lru_seconds_idle': 0,    #H
+'lru': 274853, 'at': '0xb6c9f120', 'serializedlength': 17,
+'type': 'Value'}
+# <end id="ziplist-test"/>
+#A Let's start by pushing 4 items onto a LIST
+#B We can discover information about a particular object with the 'debug object' command
+#C The information we are looking for is the 'encoding' information, which tells us that this is a ziplist, which is using 24 bytes of memory
+#D Let's push 4 more items onto the LIST
+#E We still have a ziplist, and its size grew to 36 bytes (which is exactly 2 bytes overhead, 1 byte data, for each of the 4 items we just pushed)
+#F When we push an item bigger than what was allowed for the encoding, the LIST gets converted from the ziplist encoding to a standard linked list
+#G While the serialized length went down, for non-ziplist encodings (except for the special encoding for SETs), this number doesn't represent the amount of actual memory used by the structure
+#H After a ziplist is converted to a regular structure, it doesn't get re-encoded as a ziplist if the structure later meets the criteria
+#END
+```
+More information 
+
+https://docs.redislabs.com/latest/ri/memory-optimizations/
+
+### Performance issues for long ziplists and intsets
+
+As our structures grow beyond the ziplist and intset limits, they’re automatically converted into their more typical underlying         structure types. This is done primarily because manipulating the compact versions of these structures can become slow as they         grow longer.
+
+If you keep your max ziplist sizes in the 500–2,000 item range, and you keep the max item size under 128 bytes or so, you         should get reasonable performance. I personally try to keep max ziplist sizes to 1,024 elements with item sizes at 64 bytes         or smaller. For many uses of HASHes that we’ve used so far, these limits should let you keep memory use down, and performance high.
+
+## SHARDED STRUCTURES
+
+Sharding is a well-known technique that has been used to help many different databases scale to larger data storage and processing loads. Basically, sharding takes your data, partitions it into smaller pieces based on some simple rules, and then sends the data to different locations depending on which partition the data had been assigned to.
+
+Unlike sharded HASHes and SETs, where essentially all operations can be supported with a moderate amount of work (or even LISTs with Lua scripting), commands like ZRANGE, ZRANGEBYSCORE, ZRANK, ZCOUNT, ZREMRANGE, ZREMRANGEBYSCORE, and more require operating on all of the shards of a ZSET to calculate their final result. 
+
+### HASHes
+
+To shard a HASH table, we need to choose a method of partitioning our data. Because HASHes themselves have keys, we can use those keys as a source of information to partition the keys. For partitioning our keys, we’ll generally calculate a hash function on the key itself that will produce a number. 
+
+```python
+# <start id="calculate-shard-key"/>
+def shard_key(base, key, total_elements, shard_size):   #A
+    if isinstance(key, int) or key.isdigit():   #B
+        shard_id = int(str(key), 10) // shard_size      #C
+    else:
+        key = to_bytes(key)
+        shards = 2 * total_elements // shard_size       #D
+        shard_id = binascii.crc32(key) % shards         #E
+    return "%s:%s"%(base, shard_id)                     #F
+# <end id="calculate-shard-key"/>
+#A We will call the shard_key() function with a base HASH name, along with the key to be stored in the sharded HASH, the total number of expected elements, and the desired shard size
+#B If the value is an integer or a string that looks like an integer, we will use it directly to calculate the shard id
+#C For integers, we assume they are sequentially assigned ids, so we can choose a shard id based on the upper 'bits' of the numeric id itself. We also use an explicit base here (necessitating the str() call) so that a key of '010' turns into 10, and not 8
+#D For non-integer keys, we first calculate the total number of shards desired, based on an expected total number of elements and desired shard size
+#E When we know the number of shards we want, we hash the key and find its value modulo the number of shards we want
+#F Finally, we combine the base key with the shard id we calculated to determine the shard key
+#END
+
+# <start id="sharded-hset-hget"/>
+def shard_hset(conn, base, key, value, total_elements, shard_size):
+    shard = shard_key(base, key, total_elements, shard_size)    #A
+    return conn.hset(shard, key, value)                         #B
+
+def shard_hget(conn, base, key, total_elements, shard_size):
+    shard = shard_key(base, key, total_elements, shard_size)    #C
+    return conn.hget(shard, key)                                #D
+# <end id="sharded-hset-hget"/>
+#A Calculate the shard to store our value in
+#B Set the value in the shard
+#C Calculate the shard to fetch our value from
+#D Get the value in the shard
+#END
+```
+
+If you find yourself storing a lot of relatively short strings or numbers as plain STRING values with consistently named keys like namespace:id, you can store those values in sharded HASHes for significant memory reduction in some cases, because this could be done in ziplist with sharding.
+
+
+### SETs
+
+A function to keep track of the unique visitor count on a daily basis
+
+```python
+# <start id="sharded-sadd"/>
+def shard_sadd(conn, base, member, total_elements, shard_size):
+    shard = shard_key(base,
+        'x'+str(member), total_elements, shard_size)            #A
+    return conn.sadd(shard, member)                             #B
+# <end id="sharded-sadd"/>
+#A Shard the member into one of the sharded SETs, remember to turn it into a string because it isn't a sequential id
+#B Actually add the member to the shard
+#END
+
+# <start id="unique-visitor-count"/>
+SHARD_SIZE = 512                        #B
+
+def count_visit(conn, session_id):
+    today = date.today()                                #C
+    key = 'unique:%s'%today.isoformat()                 #C
+    expected = get_expected(conn, key, today)           #D
+ 
+    id = int(session_id.replace('-', '')[:15], 16)      #E
+    if shard_sadd(conn, key, id, expected, SHARD_SIZE): #F
+        conn.incr(key)                                  #G
+# <end id="unique-visitor-count"/>
+#B And we stick with a typical shard size for the intset encoding for SETs
+#C Get today's date and generate the key for the unique count
+#D Fetch or calculate the expected number of unique views today
+#E Calculate the 56 bit id for this 128 bit UUID
+#F Add the id to the sharded SET
+#G If the id wasn't in the sharded SET, then we increment our uniqie view count
+#END
+```
+
+# Scaling Redis
+
+## SCALING READS
+
+Before we get into scaling reads, let’s first review a few opportunities for improving performance before we must resort to using additional servers with slaves to scale our queries:
+
+* If we’re using small structures (as we discussed in chapter 9), first make sure that our max ziplist size isn’t too large to cause performance penalties.
+* Remember to use structures that offer good performance for the types of queries we want to perform (don’t treat LISTs like SETs; don’t fetch an entire HASH just to sort on the client—use a ZSET; and so on).
+* If we’re sending large objects to Redis for caching, consider compressing the data to reduce network bandwidth for reads and writes (compare lz4, gzip, and bzip2 to determine which offers the best trade-offs for size/performance for our uses).
+* Remember to use pipelining (with or without transactions, depending on our requirements) and connection pooling, as we discussed in chapter 4.
+
+Briefly, we can update the Redis configuration file with a line that reads slaveof host port, replacing host and port with the host and port of the master server. We can also configure a slave by running the **SLAVEOF host port** command against an existing server. Remember: When a slave connects to a master, any data that previously existed on the slave will be discarded. To disconnect a slave from a master to stop it from slaving, we can run *SLAVEOF no one*.
+
+
+One method of addressing the slave resync issue is to reduce the total data volume that’ll be sent between the master and its slaves.
+
+![](./imgs/10fig01_alt.jpg)
+
+An alternative to building slave trees is to use compression across our network links to reduce the volume of data that needs         to be transferred. Some users have found that using SSH to tunnel a connection with compression dropped bandwidth use significantly.
+
+Generally, encryption overhead for SSH tunnels shouldn’t be a huge burden on your server, since AES-128 can encrypt around 180 megabytes per second on a single core of a 2.6 GHz Intel Core 2 processor, and RC4 can encrypt about 350 megabytes per second on the same machine. I’d recommend using compression levels below 5 if possible, since 5 still provides a 10–20% reduction in total data size over level 1, for roughly 2–3 times as much processing time.
+
+## Redis Sentinel
+https://redis.io/topics/sentinel
+https://www.cnblogs.com/jaycekon/p/6237562.html
+https://www.cnblogs.com/kevingrace/p/9004460.html
+https://juejin.im/post/5b7d226a6fb9a01a1e01ff64
+
+## SCALING WRITES AND MEMORY CAPACITY
+
+it’s time to actually shard our data to multiple machines. The methods that we use to shard our data to multiple machines rely on the number of Redis servers used being more or less fixed. If we can estimate that our write volume will, for example, increase 4 times every 6 months, we can preshard our data into 256 shards. By presharding into 256 shards, we’d have a plan that should be sufficient for the next 2 years of expected growth (how far out to plan ahead for is up to you).
+
+When presharding your system in order to prepare for growth, you may be in a situation where you have too little data to make it worth running as many machines as you could need later. To still be able to separate your data, you can run multiple Redis servers on a single machine for each of your shards, or you can use multiple Redis databases inside a single Redis server. From this starting point, you can move to multiple machines through the use of replication and configuration management (see section 10.2.1). If you’re running multiple Redis servers on a single machine, remember to have them listen on different ports, and make sure that all servers write to different snapshot files and/or append-only files.
+
+## SCALING COMPLEX QUERIES
+
+By changing slave-read-only to no and restarting our slaves, we should now be able to perform standard search queries against slave Redis servers. Remember that we cache the results of our queries, and these cached results are only available on the slave that the queries were run on. So if we intend to reuse cached results, we’ll probably want to perform some level of session persistence (where repeated requests from a client go to the same web server, and that web server always makes requests against the same Redis server).
+
+### Scaling search index size
+
+In order to shard our search queries, we must first shard our indexes so that for each document that we index, all of the data about that document is on the same shard. It turns out that our index_document() function from chapter 7 takes a connection object, which we can shard by hand with the docid that’s passed. Or, because index_document() takes a connection followed by the docid, we can use our automatic sharding decorator from listing 10.3 to handle sharding for us.
+
+
+overall we’ll need to write functions to perform the following steps:
+
+
+1.  Perform the search and fetch the values to sort on for a query against a single shard.
+
+2.  Execute the search on all shards.
+
+3.  Merge the results of the queries, and choose the subset desired.
+
+
+```python
+# <start id="search-with-values"/>
+def search_get_values(conn, query, id=None, ttl=300, sort="-updated", #A
+                      start=0, num=20):                               #A
+    count, docids, id = search_and_sort(                            #B
+        conn, query, id, ttl, sort, 0, start+num)                   #B
+
+    key = "kb:doc:%s"
+    sort = sort.lstrip('-')
+
+    pipe = conn.pipeline(False)
+    for docid in docids:                                            #C
+        if isinstance(docid, bytes):
+            docid = docid.decode('latin-1')
+        pipe.hget(key%docid, sort)                                  #C
+    sort_column = pipe.execute()                                    #C
+
+    data_pairs = list(zip(docids, sort_column))                           #D
+    return count, data_pairs, id                                    #E
+# <end id="search-with-values"/>
+#A We need to take all of the same parameters to pass on to search_and_sort()
+#B First get the results of a search and sort
+#C Fetch the data that the results were sorted by
+#D Pair up the document ids with the data that it was sorted by
+#E Return the count, data, and cache id of the results
+#END
+```
+Because we already have search_and_sort() from chapter 7, we can start by using that to fetch the result of a search. After we have the results, we can then fetch the data associated         with each search result. But we have to be careful about pagination, because we don’t know which shard each result from a         previous search came from. So, in order to always return the correct search results for items 91–100, we need to fetch the         first 100 search results from every shard. Our code for fetching all of the necessary results and data can be seen in the         next listing.
+
+```python
+# <start id="search-on-shards"/>
+def get_shard_results(component, shards, query, ids=None, ttl=300,  #A
+                  sort="-updated", start=0, num=20, wait=1):        #A
+
+    count = 0       #B
+    data = []       #B
+    ids = ids or shards * [None]       #C
+    for shard in range(shards):
+        conn = get_redis_connection('%s:%s'%(component, shard), wait)#D
+        c, d, i = search_get_values(                        #E
+            conn, query, ids[shard], ttl, sort, start, num) #E
+
+        count += c          #F
+        data.extend(d)      #F
+        ids[shard] = i      #F
+
+    return count, data, ids     #G
+# <end id="search-on-shards"/>
+#A In order to know what servers to connect to, we are going to assume that all of our shard information is kept in the standard configuration location
+#B Prepare structures to hold all of our fetched data
+#C Use cached results if we have any, otherwise start over
+#D Get or create a connection to the desired shard
+#E Fetch the search results and their sort values
+#F Combine this shard's results with all of the other results
+#G Return the raw results from all of the shards
+#END
+```
+
+This function works as explained: we execute queries against each shard one at a time until we have results from all shards. Remember that in order to perform queries against all shards, we must pass the proper shard count to the get_shard_results() function.
+
+Now that we have all of the results from all of the queries, we only need to re-sort our results so that we can get an ordering         on all of the results that we fetched. 
+
+
+### Scaling a social network
+
+In order to shard our timelines based on key name, we could write a set of functions that handle sharded versions of ZADD, ZREM, and ZRANGE, along with others
+### ZSET
+
+
+As we saw in section 10.3.2, in order to fetch items 100–109 from sharded ZSETs, we needed to fetch items 0–109 from all ZSETs and merge them together. This is because we only knew the index that we wanted to start at. Because we have the opportunity to scan based on score instead, when we want to fetch the next 10 items with scores greater than X, we only need to fetch the next 10 items with scores greater than X from all shards, followed by a merge. A function that implements ZRANGEBYSCORE across multiple shards is shown in the following listing.
+
+
+```python
+# <start id="sharded-zrangebyscore"/>
+def sharded_zrangebyscore(component, shards, key, min, max, num):   #A
+    data = []
+    for shard in range(shards):
+        conn = get_redis_connection("%s:%s"%(component, shard))     #B
+        data.extend(conn.zrangebyscore(                             #C
+            key, min, max, start=0, num=num, withscores=True))      #C
+
+    def key(pair):                      #D
+        return pair[1], pair[0]         #D
+    data.sort(key=key)                  #D
+
+    return data[:num]                   #E
+# <end id="sharded-zrangebyscore"/>
+#A We need to take arguments for the component and number of shards, and we are going to limit the arguments to be passed on to only those that will ensure correct behavior in sharded situations
+#B Fetch the sharded connection for the current shard
+#C Get the data from Redis for this shard
+#D Sort the data based on score then by member
+#E Return only the number of items requested
+#END
+
+# <start id="sharded-syndicate-posts"/>
+def syndicate_status(uid, post, start=0, on_lists=False):
+    root = 'followers'
+    key = 'followers:%s'%uid
+    base = 'home:%s'
+    if on_lists:
+        root = 'list:out'
+        key = 'list:out:%s'%uid
+        base = 'list:statuses:%s'
+
+    followers = sharded_zrangebyscore(root,                         #A
+        sharded_followers.shards, key, start, 'inf', POSTS_PER_PASS)#A
+
+    to_send = defaultdict(list)                             #B
+    for follower, start in followers:
+        timeline = base % follower                          #C
+        shard = shard_key('timelines',                      #D
+            timeline, sharded_timelines.shards, 2)          #D
+        to_send[shard].append(timeline)                     #E
+
+    for timelines in to_send.values():
+        pipe = sharded_timelines[timelines[0]].pipeline(False)  #F
+        for timeline in timelines:
+            pipe.zadd(timeline, post)                 #G
+            pipe.zremrangebyrank(                       #G
+                timeline, 0, -HOME_TIMELINE_SIZE-1)     #G
+        pipe.execute()
+
+    conn = redis.Redis()
+    if len(followers) >= POSTS_PER_PASS:
+        execute_later(conn, 'default', 'syndicate_status',
+            [uid, post, start, on_lists])
+
+    elif not on_lists:
+        execute_later(conn, 'default', 'syndicate_status',
+            [uid, post, 0, True])
+# <end id="sharded-syndicate-posts"/>
+#A Fetch the next group of followers using the sharded ZRANGEBYSCORE call
+#B Prepare a structure that will group profile information on a per-shard basis
+#C Calculate the key for the timeline
+#D Find the shard where this timeline would go
+#E Add the timeline key to the rest of the timelines on the same shard
+#F Get a connection to the server for the group of timelines, and create a pipeline
+#G Add the post to the timeline, and remove any posts that are too old
+#END
+```
+
+As you can see from the code, we use the sharded ZRANGEBYSCORE function to fetch those users who are interested in this user’s posts. Also, in order to keep the syndication process fast,         **we group requests that are to be sent to each home or list timeline shard server together**. Later, after we’ve grouped all         of the writes together, we add the post to all of the timelines on a given shard server with a pipeline.
+
+
+## SUMMARY
+
+We’ve used read-only slaves, writable query slaves, and sharding combined with shard-aware         classes and functions. 
+
+# Scripting Redis with Lua
+
+## Adding functionality without writing C
+## Rewriting locks and semaphores with Lua
+## Doing away with WATCH/MULTI/EXEC
+## Sharding LISTs with Lua
+
+
+秒杀
+https://juejin.im/post/5dd09f5af265da0be72aacbd
+
+面试
+https://blog.csdn.net/sinat_35512245/article/details/59056120
+

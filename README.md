@@ -1781,15 +1781,362 @@ We’ve used read-only slaves, writable query slaves, and sharding combined with
 
 # Scripting Redis with Lua
 
+
 ## Adding functionality without writing C
+
+```python
+# <start id="script-load"/>
+def script_load(script):
+    sha = [None]                #A
+    def call(conn, keys=[], args=[], force_eval=False):   #B
+        if not force_eval:
+            if not sha[0]:   #C
+                sha[0] = conn.execute_command(              #D
+                    "SCRIPT", "LOAD", script, parse="LOAD") #D
+    
+            try:
+                return conn.execute_command(                    #E
+                    "EVALSHA", sha[0], len(keys), *(keys+args)) #E
+        
+            except redis.exceptions.ResponseError as msg:
+                if not msg.args[0].startswith("NOSCRIPT"):      #F
+                    raise                                       #F
+        
+        return conn.execute_command(                    #G
+            "EVAL", script, len(keys), *(keys+args))    #G
+    
+    return call             #H
+# <end id="script-load"/>
+#A Store the cached SHA1 hash of the result of SCRIPT LOAD in a list so we can change it later from within the call() function
+#B When calling the "loaded script", you must provide the connection, the set of keys that the script will manipulate, and any other arguments to the function
+#C We will only try loading the script if we don't already have a cached SHA1 hash
+#D Load the script if we don't already have the SHA1 hash cached
+#E Execute the command from the cached SHA1
+#F If the error was unrelated to a missing script, re-raise the exception
+#G If we received a script-related error, or if we need to force-execute the script, directly execute the script, which will automatically cache the script on the server (with the same SHA1 that we've already cached) when done
+#H Return the function that automatically loads and executes scripts when called
+#END
+```
+
+When Redis cluster is released, which will offer automatic multiserver sharding, keys will be checked before a script is run, and will return an error if any keys that aren’t on the same server are accessed.
+
+As you already know, *individual commands in Redis are atomic* in that they’re run one at a time. With MULTI/EXEC, you can prevent other commands from running while you’re executing multiple commands. But to Redis, EVAL and EVALSHA are each considered to be a (very complicated) command, so they’re executed without letting any other structure operations occur.
+
+Besides, we could use Lua to combine different command together, thus we could run a bunch of commandin one run, reduce the latency.
+
+When executing a Lua script with EVAL or EVALSHA, Redis doesn’t allow any other read/write commands to run. This can be convenient. But because Lua is a general-purpose programming language, you can write scripts that never return, which could stop other clients from executing commands. To address this,         Redis offers two options for stopping a script in Redis, depending on whether you’ve performed a Redis call that writes.
+
+
 ## Rewriting locks and semaphores with Lua
+Why locks in Lua?
+The reason is because there are situations where manipulating data in Redis requires data that’s not available at the time of the initial call. One example would be fetching some HASH values from Redis, and then using those values to access information from a relational database, which then results in a         write back to Redis.
+
+Rewriting our lock
+
+```python
+# <start id="old-lock"/>
+def acquire_lock_with_timeout(
+    conn, lockname, acquire_timeout=10, lock_timeout=10):
+    identifier = str(uuid.uuid4())                      #A
+    lockname = 'lock:' + lockname
+    lock_timeout = int(math.ceil(lock_timeout))         #D
+    
+    end = time.time() + acquire_timeout
+    while time.time() < end:
+        if conn.setnx(lockname, identifier):            #B
+            conn.expire(lockname, lock_timeout)         #B if the applicatoin is down before the executoin of this line of code, there is no ttl set on the lock. 
+            return identifier
+        elif conn.ttl(lockname) < 0:                    #C  for lua, we don't need this anymore, the ttl must be set.
+            conn.expire(lockname, lock_timeout)         #C
+    
+        time.sleep(.001)
+    
+    return False
+# <end id="old-lock"/>
+#A A 128-bit random identifier
+#B Get the lock and set the expiration
+#C Check and update the expiration time as necessary
+#D Only pass integers to our EXPIRE calls
+#END
+
+_acquire_lock_with_timeout = acquire_lock_with_timeout
+
+# <start id="lock-in-lua"/>
+def acquire_lock_with_timeout(
+    conn, lockname, acquire_timeout=10, lock_timeout=10):
+    identifier = str(uuid.uuid4())                      
+    lockname = 'lock:' + lockname
+    lock_timeout = int(math.ceil(lock_timeout))      
+    
+    acquired = False
+    end = time.time() + acquire_timeout
+    while time.time() < end and not acquired:
+        acquired = acquire_lock_with_timeout_lua(                   #A
+            conn, [lockname], [lock_timeout, identifier]) == b'OK'  #A
+    
+        time.sleep(.001 * (not acquired))
+    
+    return acquired and identifier
+
+acquire_lock_with_timeout_lua = script_load('''
+if redis.call('exists', KEYS[1]) == 0 then              --B
+    return redis.call('setex', KEYS[1], unpack(ARGV))   --C
+end
+''')
+# <end id="lock-in-lua"/>
+#A Actually acquire the lock, checking to verify that the Lua call completed successfully
+#B If the lock doesn't already exist, again remembering that tables use 1-based indexing
+#C Set the key with the provided expiration and identifier
+#END
+```
+
+There aren’t any significant changes in the code, except that we change the commands we use so that if a lock is acquired, it always has a timeout. 
+```python
+def release_lock(conn, lockname, identifier):
+    pipe = conn.pipeline(True)
+    lockname = 'lock:' + lockname
+    
+    while True:
+        try:
+            pipe.watch(lockname)                  #A
+            if pipe.get(lockname) == identifier:  #A
+                pipe.multi()                      #B
+                pipe.delete(lockname)             #B
+                pipe.execute()                    #B
+                return True                       #B
+    
+            pipe.unwatch()
+            break
+    
+        except redis.exceptions.WatchError:       #C
+            pass                                  #C
+    
+    return False                                  #D
+
+_release_lock = release_lock
+
+# <start id="release-lock-in-lua"/>
+def release_lock(conn, lockname, identifier):
+    lockname = 'lock:' + lockname
+    return release_lock_lua(conn, [lockname], [identifier]) #A
+
+release_lock_lua = script_load('''
+if redis.call('get', KEYS[1]) == ARGV[1] then               --B
+    return redis.call('del', KEYS[1]) or true               --C
+end
+''')
+# <end id="release-lock-in-lua"/>
+#A Call the Lua function that releases the lock
+#B Make sure that the lock matches
+#C Delete the lock and ensure that we return true
+#END
+```
+
+
+Unlike acquiring the lock, releasing the lock became shorter as we no longer needed to perform all of the typical WATCH/MULTI/EXEC steps.
+
+![](./imgs/10fig01_alt.jpg)
+
+Looking at the data from our benchmark (pay attention to the right column), one thing to note is that Lua-based locks succeed         in acquiring and releasing the lock in cycles significantly more often than our previous lock—by more than 40% with a single         client, 87% with 2 clients, and over 100% with 5 or 10 clients attempting to acquire and release the same locks. Comparing         the middle and right columns, we can also see how much faster attempts at locking are made with Lua, primarily due to the         reduced number of round trips.                  But even better than performance improvements, our code to acquire and release the locks is significantly easier to understand         and verify as correct.
+
+| Benchmark configuration   | Tries in 10 seconds | Acquires in 10 seconds |
+|---------------------------|---------------------|------------------------|
+| Original lock, 1 client   | 31,359              | 31,359                 |
+| Original lock, 2 clients  | 30,085              | 22,507                 |
+| Original lock, 5 clients  | 47,694              | 19,695                 |
+| Original lock, 10 clients | 71,917              | 14,361                 |
+| Lua lock, 1 client        | 44,494              | 44,494                 |
+| Lua lock, 2 clients       | 50,404              | 42,199                 |
+| Lua lock, 5 clients       | 70,807              | 40,826                 |
+| Lua lock, 10 clients      | 96,871              | 33,990                 |
+
+Looking at the data from our benchmark (pay attention to the right column), one thing to note is that Lua-based locks succeed         in acquiring and releasing the lock in cycles significantly more often than our previous lock—by more than 40% with a single         client, 87% with 2 clients, and over 100% with 5 or 10 clients attempting to acquire and release the same locks. Comparing         the middle and right columns, we can also see how much faster attempts at locking are made with Lua, primarily due to the         reduced number of round trips.                  But even better than performance improvements, our code to acquire and release the locks is significantly easier to understand         and verify as correct.
+
+### Counting semaphores in Lua
+In the process of translating this function into Lua, after cleaning out timed-out semaphores, it becomes possible to know whether a semaphore is available to acquire, so we can simplify our code in the case where a semaphore isn’t available. Also, because everything is occurring inside Redis, we don’t need the counter or the owner ZSET, since the first client to execute their Lua function should be the one to get the semaphore. 
+```python
+# <start id="old-acquire-semaphore"/>
+def acquire_semaphore(conn, semname, limit, timeout=10):
+    identifier = str(uuid.uuid4())                             #A
+    now = time.time()
+
+    pipeline = conn.pipeline(True)
+    pipeline.zremrangebyscore(semname, '-inf', now - timeout)  #B
+    pipeline.zadd(semname, {identifier:now})                   #C
+    pipeline.zrank(semname, identifier)                        #D
+    if pipeline.execute()[-1] < limit:                         #D
+        return identifier
+
+    conn.zrem(semname, identifier)                             #E
+    return None
+# <end id="old-acquire-semaphore"/>
+#A A 128-bit random identifier
+#B Time out old semaphore holders
+#C Try to acquire the semaphore
+#D Check to see if we have it
+#E We failed to get the semaphore, discard our identifier
+#END
+
+_acquire_semaphore = acquire_semaphore
+
+# <start id="acquire-semaphore-lua"/>
+def acquire_semaphore(conn, semname, limit, timeout=10):
+    now = time.time()                                           #A
+    return acquire_semaphore_lua(conn, [semname],               #B
+        [now-timeout, limit, now, str(uuid.uuid4())])           #B
+
+acquire_semaphore_lua = script_load('''
+redis.call('zremrangebyscore', KEYS[1], '-inf', ARGV[1])        --C
+
+if redis.call('zcard', KEYS[1]) < tonumber(ARGV[2]) then        --D
+    redis.call('zadd', KEYS[1], ARGV[3], ARGV[4])               --E
+    return ARGV[4]
+end
+''')
+# <end id="acquire-semaphore-lua"/>
+#A Get the current timestamp for handling timeouts
+#B Pass all of the required arguments into the Lua function to actually acquire the semaphore
+#C Clean out all of the expired semaphores
+#D If we have not yet hit our semaphore limit, then acquire the semaphore
+#E Add the timestamp the timeout ZSET
+#END
+
+def release_semaphore(conn, semname, identifier):
+    return conn.zrem(semname, identifier)
+
+# <start id="refresh-semaphore-lua"/>
+def refresh_semaphore(conn, semname, identifier):
+    return refresh_semaphore_lua(conn, [semname],
+        [identifier, time.time()]) != None          #A
+
+refresh_semaphore_lua = script_load('''
+if redis.call('zscore', KEYS[1], ARGV[1]) then                   --B
+    return redis.call('zadd', KEYS[1], ARGV[2], ARGV[1]) or true --B
+end
+''')
+# <end id="refresh-semaphore-lua"/>
+#A If Lua had returned "nil" from the call (the semaphore wasn't refreshed), Python will return None instead
+#B If the semaphore is still valid, then we update the semaphore's timestamp
+#END
+```
+This updated semaphore offers the same capabilities of the lock-wrapped acquire_fair_semaphore_with_lock(), including being completely fair. Further, because of the simplifications we’ve performed (no locks, no ZINTERSTORE, and no ZREMRANGEBYRANK), our new semaphore will operate significantly faster than the previous semaphore implementation, while at the same time reducing the complexity of the semaphore itself.
+
 ## Doing away with WATCH/MULTI/EXEC
+
+**Generally, when there are few writers modifying WATCHed data, these transactions complete without significant contention or retries. But if operations can take several round trips to execute, if contention is high, or if network latency is high, clients may need to perform many retries in order to complete operations.**
+
+Performance of our original autocomplete versus our Lua-based autocomplete over 10 seconds
+
+| Benchmark configuration           | Tries in 10 seconds | Autocompletes in 10 seconds |
+|-----------------------------------|---------------------|-----------------------------|
+| Original autocomplete, 1 client   | 26,339              | 26,339                      |
+| Original autocomplete, 2 clients  | 35,188              | 17,551                      |
+| Original autocomplete, 5 clients  | 59,544              | 10,989                      |
+| Original autocomplete, 10 clients | 57,305              | 6,141                       |
+| Lua autocomplete, 1 client        | 64,440              | 64,440                      |
+| Lua autocomplete, 2 clients       | 89,140              | 89,140                      |
+| Lua autocomplete, 5 clients       | 125,971             | 125,971                     |
+| Lua autocomplete, 10 clients      | 128,217             | 128,217                     |
+
+when executing the older autocomplete function that uses WATCH/MULTI/EXEC transactions, the probability of finishing a transaction is reduced as we add more clients, and the total attempts over 10 seconds hit a peak limit. On the other hand, our Lua autocomplete can attempt and finish far more times every second, primarily due to the reduced overhead of fewer network round trips, as well as not running into any WATCH errors due to contention. Looking at just the 10-client version of both, the 10-client Lua autocomplete is able to complete more than 20 times as many autocomplete operations as the original autocomplete.
+
+Performance of Lua compared with no locking, coarse-grained locks, and fine-grained locks over 60 seconds
+
+
+  
+↧ Expand ↧
+ GeneratePut tabs between columnsCompact modeLine breaks as <br>
+Result (click "Generate" to refresh) Copy to clipboard
+|                                             | Listed items | Bought items | Purchase retries | Average wait per purchase |
+|---------------------------------------------|--------------|--------------|------------------|---------------------------|
+| 5 listers, 5 buyers, no lock                | 206,000      | <600         | 161,000          | 498ms                     |
+| 5 listers, 5 buyers, with lock              | 21,000       | 20,500       | 0                | 14ms                      |
+| 5 listers, 5 buyers, with fine-grained lock | 116,000      | 111,000      | 0                | <3ms                      |
+| 5 listers, 5 buyers, using Lua              | 505,000      | 480,000      | 0                | <1ms                      |
+
+From this table, we can see the performance advantages of coarse-grained locks over WATCH/MULTI/EXEC, fine-grained locks over coarse-grained locks, and Lua over fine-grained locks. That said, try to remember that while Lua can offer extraordinary performance         advantages (and substantial code simplification in some cases), Lua scripting in Redis is limited to data we can access from         within Lua and Redis, whereas there are no such limits when using locks or WATCH/MULTI/EXEC transactions.
+
 ## Sharding LISTs with Lua
 
+## Summary
 
+If there’s one idea that you should take away from this chapter, it’s that scripting with Lua can greatly improve performance and can simplify the operations that you need to perform. Though there are some limitations with Redis scripting across shards that aren’t limitations when using locks or WATCH/MULTI/EXEC transactions in some scenarios, Lua scripting is a significant win in the majority of situations.
+
+
+## 
 秒杀
 https://juejin.im/post/5dd09f5af265da0be72aacbd
 
 面试
 https://blog.csdn.net/sinat_35512245/article/details/59056120
+
+
+# Cookbook
+
+## Event model
+
+Redis contains a simple but powerful asynchronous event library called ae to wrap different operating system's polling facilities, such as *epoll, kqueue, select*, and so on.So what's a polling facility of an operating system? 
+
+Let's take a real-life scenario to illustrate it. Imagine you have ordered five dishes in a restaurant. You have to fetch your dishes by yourself at a waiting window, and you want to get them as soon as possible once the dishes get done because you are hungry. You may have three strategies for this scenario:
+
+1. You walk to the waiting window all by yourself from time to time in a short period to check whether each dish in the order list is ready.
+
+2. You hire five people. Each person walks to the waiting window for you to check whether one of the dishes you ordered is ready.
+
+3. You just sit at the table, waiting for the notification. The restaurant provides a dish-ready notification service for free which means that the waiter will tell you which dish is ready, once a dish gets done. When you get the notification, you fetch it by yourself.
+
+Considering the time and efforts it takes, the third option is the best one, obviously.
+
+The polling facility of an operating system works in a similarly way as the third option does. For the simplicity of this section, we only take the epoll API in Linux as an example. First, you can call *epoll_create* to tell the kernel that you would like to use epoll. Then, you call *epoll_ctl* to tell the kernel the file descriptors (FD) and what type of event you're interested in when an update occurs. After that, epoll_wait gets called to wait for certain events of the FDs you set in *epoll_ctl*. The kernel will send a notification to you when the FDs get updated. The only thing you have to do is to create handlers for certain events.The whole multiplexing process is shown as follows:
+
+![](./imgs/65a04acf-291b-4f15-862b-cf2b794d2fe4.png)
+
+It's clear that **no thread or sub-process** spawns or interacts in the polling process. Therefore, the key benefit of this model is that it's a light context switch I/O model, so that it's not costly for context switching. A number of limitations need to be considered for this processing model. The most common problem you may encounter is latency. In the polling model, **Redis won't process any other commands until the one being processed finishes**. So keep in mind from now on that an unexpected latency will be the first headache for you when using Redis.
+
+## Redis protocol
+
+Redis is merely a non-blocking, I/O multiplexing TCP server that accepts and processes requests from clients. 
+
+### String
+
+It is worth mentioning how strings are encoded in Redis objects internally. Redis uses three different encodings to store string objects and will decide the encoding automatically per string value:
+
+1. int: For strings representing 64-bit signed integers
+
+2. embstr: For strings whose length is less or equal to 44 bytes (this used to be 39 bytes in Redis 3.x); this type of encoding is more efficient in memory usage and performance
+
+3.raw: For strings whose length is greater than 44 bytes
+
+### List
+There are blocking versions for the command LPOP and RPOP: BLPOP and BRPOP. They both pop an element from the left or right end of the list, such as the corresponding non-blocking commands, but the client will be blocked if the list is empty. A timeout in seconds has to be specified in these blocking pop commands for the maximum time to wait. Zero timeout means waiting forever. This feature is useful in the job dispatcher scenario, where multiple workers (Redis Clients) are waiting for the dispatcher to assign new jobs. The workers just use BLPOP or BRPOP on a job list in Redis. Whenever there is a new job, the dispatcher pushes the job into the list, and one of the workers will pick it up.
+
+Redis uses quicklist encoding internally to store list objects. There are two configuration options to tweak the memory storage of the list object:
+
+1. list-max-ziplist-size: The maximum size of an internal list node in a list entry. In most cases, just leave the default value.
+
+2. list-compress-depth: The list compress policy. If you are going to use the head and the tail elements of a list in Redis, you can utilize this setting to have a better list compression ratio.
+
+
+### Hash
+Redis uses two encodings internally to store hash objects:
+
+1. ziplist: For hashes whose length is less than list-max-ziplist-entries (default: 512) and the size of every element in the list is less than list-max-ziplist-value (default: 64 bytes) in configuration. ziplist is used to save space for small hashes.
+
+2. hashtable: The default encoding when ziplist encoding cannot be used per configuration.
+
+### Set
+
+Redis uses two encodings internally to store set objects:
+
+1. intset: For sets in which all elements are integers and the number of elements in the set is less than set-max-intset-entries (default: 512) in configuration. intset is used to save space for small hashes.
+2. hashtable: The default encoding when intset encoding cannot be used per configuration.
+
+
+### ZSet
+
+For your reference, Redis also uses two encodings internally to store sorted set objects, like the data type list mentioned in the Using the hash data type recipe :
+
+1. ziplist: For a sorted set whose length is less than zset-max-ziplist-entries (default: 128) and the size of every element in the set is less than zset-max-ziplist-value (default: 64 bytes) in configuration. ziplist is used to save space for small lists.
+
+2. skiplist: The default encoding when ziplist encoding cannot be used per configuration.
 

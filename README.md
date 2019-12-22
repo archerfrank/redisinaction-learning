@@ -2262,7 +2262,68 @@ Both the notification-script and client-config-script will be executed on all 
 
 The script should return 0 if the execution is successful. It will be retried up to 10 times if the return value is 1. If a script does not finish in 60 seconds, it will be terminated with a SIGKILL and will be retried up to 10 times. The script will not be retried if returning a value higher than 1.
 
-## 
+## Redis Cluster
+
+show you how to use Redis Cluster to achieve automatic data sharding and high availability in Redis. 
+
+
+![](./imgs/600e82d8-3d21-43ba-9a9a-e3676df2cadc.png)
+
+When a Redis Cluster is running, each node has two TCP sockets open. The first is the standard Redis protocol for client connection. The second port is calculated from the sum of the first port plus 10,000 and used as a communication bus for node-to-node information exchange. This value 10,000 is hardcoded. Therefore, you can't start a Redis Cluster node with a listening port greater than 55536.
+
+```properties
+cluster-enabled yes
+cluster-config-file nodes-6381.conf
+cluster-node-timeout 10000
+```
+
+After specifying a different listening port and data path for each instance separately, we enabled the Cluster feature by setting the cluster-enabled option to yes. Moreover, for each Redis instance, there is a Cluster node configuration file which will be generated during the setup of Redis Cluster, and can be modified every time some Cluster information should be persisted. The cluster-config-file option sets the name of this configuration file.
+
+The Cluster node configuration file should not be changed manually.
+
+So, the first step we take is to let each node meet each other so that they can be working correctly in a Cluster. The command CLUSTER MEET is used for this purpose.
+
+Although it is required that all nodes in a Redis Cluster know each other, there is no need to send this command to every node. That's because one node will propagate the information of its known nodes once it meets another node (that is the meaning of the exchange-of-gossip information in heartbeat packets mentioned in Redis Cluster documents). To avoid confusion, we can let one node meet all the other nodes. This way, all the nodes in a Cluster can communicate with each other.
+
+In Redis Cluster, data is distributed into **16384** hash slots by the algorithm shown next:
+
+HASH_SLOT = CRC16(key) mod 16384
+
+Each master node is assigned a sub-range of hash slots to store a portion of the whole dataset. 
+
+The reason is:
+
+Normal heartbeat packets carry the full configuration of a node, that can be replaced in an idempotent way with the old in order to update an old config. This means they contain the slots configuration for a node, in raw form, that uses 2k of space with 16k slots, but would use a prohibitive 8k of space using 65k slots.
+At the same time it is unlikely that Redis Cluster would scale to more than 1000 master nodes because of other design tradeoffs.
+So 16k was in the right range to ensure enough slots per master with a max of 1000 maters, but a small enough number to propagate the slot configuration as a raw bitmap easily. Note that in small clusters the bitmap would be hard to compress because when N is small the bitmap would have slots/N bits set that is a large percentage of bits set.
+
+### Testing Redis Cluster
+
+The first testing we performed is to bring a master instance down. We used the  DEBUG SEGFAULT command to crash the I_A instance with the node ID 58285fa03c19f6e6f633fb5c58c6a314bf25503f. This command resulted in a segmentation fault of a Redis instance. As a result, the instance exited, as shown in the log of I_A. From the output of the testing program, it can be seen clearly that some write and read requests failed for a while. Later, the Cluster resumed handling the requests. In fact, the period when the Cluster didn't work relates to the process of the I_A1 failover. Let's dive into the log of I_A1 to learn more about the failover.
+
+First, the slave instance found that the connection to its master got lost at 14:49:40. It tried to reconnect to its master instance for around 10 seconds, which is the amount of time specified by the option cluster-node-timeout. Later, at 14:49:50, the failure of the I_A instance was confirmed by the received FAIL message, and the state of the Cluster was considered to be a failure. I_A1 got voted by the two alive masters, and then it was turned in the new master at 14:49:51. Finally, the state of the Cluster was changed to OK again. From the timeline shown in the logs of other masters and slaves, we can tell that I_B, whose node ID is 2ff47eb511f0d251eff1d5621e9285191a83ce9f, first marked the I_A as FAIL and broadcasted this message to all the slaves.
+
+Although all the slots were covered and the state of the Cluster was OK, by checking the Cluster, we found that the new master serving the slots 0-5400 had no replica.
+
+The second testing we performed was to recover the crashed node in the previous testing. By starting the I_A instance again, we found it became a slave of the I_A1 instance, which is now a master node after failover. The FAIL state of I_A was removed and a resynchronization was started. Finally, the new master instance I_A1 serving the slots 0-5400 had one replica provided by I_A.
+
+The third testing we performed was to crash a slave. The node we picked was I_C1. After bringing I_C1 down, we found the state of the Cluster was not changed because the instance that crashed was a slave that didn't serve the slots.
+
+The last testing we performed was to bring down both master and slave of one shard. Because not all the slots were covered, the state of the Cluster was turned into FAIL. So, the testing program got the error CLUSTERDOWN The cluster is down.
+
+So, in our example, if we crashed two masters almost at the same time, the Cluster won't do the failover even if the two masters have their slaves separately. That is because the majority of masters are down. As a result, no PFAIL can be set to FAIL. Therefore, no failover will take place.
+
+
+### Administrating Redis Cluster 
+
+One thing you should know is that, while the slots are being resharded from node to node, writing and reading requests to the Cluster won't be affected.
+
+You don't need additional failover handling when using Redis Cluster and you should definitely not point Sentinel instances at any of the Cluster nodes. 
+
+Check out reshard and add or remove master node.
+https://medium.com/@iamvishalkhare/horizontal-scaling-in-out-techniques-for-redis-cluster-dcd75c696c86 
+
+
 
 
 

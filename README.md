@@ -2140,3 +2140,137 @@ For your reference, Redis also uses two encodings internally to store sorted set
 
 2. skiplist: The default encoding when ziplist encoding cannot be used per configuration.
 
+## Replication
+
+There are two resynchronization mechanisms in Redis replication: **partial resynchronization and full resynchronization**. When a Redis slave instance is started and connected to the master instance, it will always try to request a partial resynchronization by sending (master_replid; master_repl_offset), which indicates the last snapshot in sync with the master. If the master accepts the partial resynchronization, it will stream the incremental part of the commands starting with the last offset the slave stopped at. Otherwise, a full resynchronization is required. A full resynchronization is always needed the first time the slave connects to its master. Details about how the master decides whether to accept a partial resynchronization request will be discussed in the following Optimizing replication recipe. In order to copy all the data to the slave, the master needs to dump the data into a RDB file and then send the file to the slave. Once the slave receives the RDB file, it will flush all its data in memory and apply the data to the RDB file. The replication process on the master is purely asynchronous so it will not block the server from processing client requests at all.
+
+Please note, partial resynchronization after a slave restart was a new feature in Redis 4.0. In the implementation of Redis 4.0, master_replid and offset are stored in the RDB file. When the slave is shut down gracefully and restarted, master_replid and offset will be loaded with the RDB file, which makes partial resynchronization possible.
+
+![](./imgs/e237a2a7-f6ed-47ba-beec-fa57eb3168c5.png)
+
+
+When a slave instance is promoted to a master instance, other slaves have to resync from the new master. Prior to Redis 4.0, this process is a full resynchronization because master_replid changed on the master. Since Redis 4.0, the new master remembers the master_replid and offset from the old master and therefore can accept partial resynchronization requests from other slaves, even if the master_replid in the requests is different. 
+
+## Optimizing replication
+
+In Redis, we call this buffer a replication backlog. Redis uses this backlog buffer to decide whether to start a full or partial data resynchronization. More specifically, after issuing the SLAVEOF command, the slave sends a partial resynchronization request to the master with the last replication offset and the ID of the last master (master_replid). When the connection between the master and slave is established, the master will first check if the master_replid in the request matches its own master_replid. Then, it will check if the offset in the request is retrievable from its **backlog buffer**. If the offset is in the range of the backlog, all the write commands during disconnection could be obtained from it, which indicates that a partial resynchronization can be done. Otherwise, if the volume of the write commands the master instance received during disconnection is more than the backlog buffer can store, the request for a partial resynchronization will be denied. Instead, a full data resynchronization will be started. That is to say, **the default size of the replication backlog, which is 1 MB**, is enough to store the write commands only if a small amount of data is written into the master during replication disconnection.
+
+By calculating the delta value of the master_repl_offset from the INFO command during peak hours, we can estimate an appropriate size for the replication backlog:
+
+Another parameter for the replication backlog is **repl-backlog-ttl**, which indicates, if all slaves get disconnected from the master, how long the master Redis instance will wait to release the memory of the backlog. The default value of this parameter is 3600s, which is generally not a problem since the backlog buffer is quite small compared to the Redis instance memory.
+
+ From the point of view of network transmission, you can use less bandwidth by tuning the parameter **repl-disable-tcp-nodelay to yes**. If set to yes, Redis will try to combine several small packets into one packet. This is useful when the location of a master server is far from the slave server. Extra attention should be paid to the fact that this can lead to around 40 ms replication delay.
+
+ ## Troubleshooting replication
+
+  From the master's point of view, to tell whether slaves are still alive, the master sends a PING at a predefined interval. You can adjust this interval by setting the configuration **repl-ping-slave-period** in the configuration file or from redis-cli. The default value of the ping interval is 10 s. From the slave's point of view, one slave sends **REPLCONF ACK {offset}** every second to report its replication offset. For both PING and REPLCONF ACK, there is a timeout specified by **repl-timeout**. The default value of the replication timeout is 60 s. If the interval between two PING or REPLCONF ACK is longer than the timeout, or there is no data traffic between master and slaves within repl-timeout, the replication connection will be cut off. The slave will have to initiate another replication request.
+
+The second testing scenario is another common production issue. As we described in the Setting up Redis replication recipe, when establishing replication, a master instance first dumps its memory in the form of an RDB file and sends it to the slaves. When a slave finishes receiving the RDB file, it loads the RDB file into its memory. During these steps, all the write commands to the master instance will be buffered in a special client buffer called **Slave client buffer**. After loading RDB, the master will send the content of this buffer to a slave.
+
+There is a limitation to the size of the buffer, which if exceeded will cause replication to start from the beginning. The default size limit of a replication buffer is **slave 256 MB 64 MB 60**. The word slave indicates this is the buffer size for slaves. The value 256 MB is a hard limit. Once this buffer size limit is reached, the master will close the connection immediately. The value 64 MB and 60 as a whole are soft limits. It means the master will close the connection once the buffer size is larger than 64 MB for a continuous period of 60 seconds. 
+
+In real production environment, the value of **repl-ping-slave-period** must be smaller than the value of **repl-timeout**. *Otherwise, replication timeout will be reached every time there is low traffic between master and slave*. Usually, a blocking operation may cause replication timeout since the command processing engine of the Redis Server is single-threaded. To prevent the replication timeout from happening, you should try your best to avoid the use of long blocking commands. The default value of repl-timeout is enough for most cases.
+
+The last thing we would like to mention is that Redis takes a master-driven policy for the expiration of keys. That is to say, when a master expires a key it sends a DEL command to all the slaves. The DEL command is also buffered in the replication client buffer during synchronization.
+
+## Manipulating RDB
+
+The pattern of the value is x1, y1, x2, y2,.... That means, dumping the data in Redis after x seconds if at least y keys have been changed and no dumping process is in progress.
+
+For the preceding example, 900 1 means that, once at least 1 key has changed within 900 seconds, an RDB snapshot will be taken. 
+
+Thanks to the Copy-On-Write (COW) mechanism, there is no need for the child process to use the same amount of memory as the Redis Server does.
+
+## Manipulating AOF
+
+While Redis keeps appending write commands to the AOF file, the file size may grow significantly. This will slow the replay process when Redis is starting. Redis provides a mechanism to compress the AOF file with an AOF rewrite. As you might have guessed, some of the Redis keys had been deleted or expired, so they can be cleaned up in the AOF file. The values for certain Redis keys were updated multiple times and only the latest value needs to be stored in the AOF file. This is the basic idea of data compaction in an AOF rewrite. We can use the BGREWRITEAOF command to initiate the rewrite process, or let Redis perform an AOF rewrite automatically. We will discuss AOF rewrites in the following recipe.
+
+A child process will be forked from the Redis main process to perform an AOF rewrite. The child process will create a new AOF file to store the rewrite results, so that the old AOF file will not be impacted in case the rewrite operation fails. The parent process continues to serve traffic and dumps write commands to the old AOF file. The COW mechanism is used when forking the child process, so it does not take the same amount of memory as the parent. However, because of the COW mechanism, the child process is not able to access the new data after the fork. Redis solves this problem by letting the parent process push write commands that are received after the fork into a buffer called aof_rewrite_buf_blocks. Once the child process finishes rewriting the new AOF file, it will send a signal to the parent process. The parent process will flush commands from aof_rewrite_buf_blocks into the new AOF file, then replace the old AOF file with the new one.
+
+Besides manually triggering an AOF rewrite with the BGREWRITEAOF command, we can also configure Redis to execute an AOF rewrite automatically. The following two configuration parameters are for this purpose:
+
+**auto-aof-rewrite-min-size**: An AOF rewrite will not be triggered if the AOF file size is less than this value. The default value is 64 MB.
+
+**auto-aof-rewrite-percentage**: Redis will remember the AOF file size after the last AOF rewrite operation. If the current AOF file size has increased by this percentage value, another AOF rewrite will be triggered. Setting this value to 0 will disable Automatic AOF Rewrite. The default value is 100.
+
+## Combining RDB and AOF
+
+After enabling both RDB and AOF methods, we set the configuration option **aof-use-rdb-preamble to yes** to enable the new mix-format persistence feature, provided since Redis 4.x. Once this option is set to yes, when rewriting the AOF file, Redis dumps the dataset in memory in the format of RDB first as a preamble of AOF. After rewriting, Redis continues to log the write commands in the AOF file, using the traditional AOF format. This kind of mixed format can be verified clearly via exploring the head and the tail of the AOF file after a rewrite. The RDB format is used first, at the beginning of the AOF file, if mix format is enabled. Redis benefits from the mixed persistence format, as Redis can rewrite and load the data file more quickly due to the compacted format of RDB, while retaining the merits of AOF for better data consistency.
+
+It's advisable to enable AOF and the mixed format of persistence after Redis 4.x.
+
+Redis guarantees that RDB dumping and AOF rewrites will never run at the same time. When starting up, Redis will always load the AOF file first, if it exists, even when both persistence options are enabled and the RDB file also exists. 
+
+## Setting up Sentinel
+
+Because the master failover decision is based on a quorum system, at least three Sentinel processes are required as a robust distributed system that keeps monitoring the status of the Redis master data server.
+
+**sentinel monitor mymaster 192.168.0.31 6379 2** means the Sentinel is going to monitor the master server on 192.168.0.31:6379, which is named mymaster. <quorum> means the minimum number of Sentinels that agree the master server is unreachable before a failover action can be taken. The **down-after-milliseconds** option means the maximum time in milliseconds that a Redis instance is allowed to be unreachable before the Sentinel marks it as down. The Sentinel will ping the data server every second to check if it is reachable.
+
+The parallel-syncs option denotes how many slaves can start the synchronization from the new master simultaneously.
+
+**You may think that, in order to get the slaves' information, the Sentinel can send the INFO REPLICATION command to the master. If there are multiple levels of slaves, they can be discovered in this way recursively. In fact, every 10 seconds, each Sentinel process sends INFO REPLICATION to all the data nodes (including masters and detected slaves) it is monitoring, to pull the latest information of the entire replication topology.**
+
+**To detect and communicate with other Sentinel processes, every two seconds each Sentinel publishes a message about its status and its view of the master status to a channel named __sentinel__:hello. Therefore, other Sentinels' information can be discovered by subscribing to this channel.**
+
+The configuration files for Redis Sentinel will also be updated to reflect the information about slaves and other Sentinels. That's why the configuration file must be writable by the Sentinel process.
+
+with Redis Sentinel enabled, the master server's address will change when master failover happens. To get the latest master information, the client needs to query from the Sentinel. This can be done by the command sentinel get-master-addr-by-name <master-name>. The actual process is more complicated and we are not going to cover it here. Fortunately, both the Jedis and redis-py libraries have Sentinel support.
+
+## Testing Sentinel
+
+### Triggering a master failover manually
+
+1. Since this failover was triggered manually, the Sentinel does not need to seek agreements from other Sentinels before performing the failover operation. It was elected as the leader directly without any consensus.
+2. Next, the Sentinel picked up a slave to promote, which is 192.168.0.33 in this experiment.
+3. The Sentinel sent the command slaveof no one to 192.168.0.33, so it became a master. If we check the server log of 192.168.0.33, we will find that the server received the command from Sentinel-2, stopped replicating from the old master 192.168.0.31, and was promoted to a master itself.
+4. The Sentinel reconfigured the old master 192.168.0.31 and an other slave 192.168.0.32 to let them replicate from the new master.
+5. In the last step, the Sentinel updated the information of the new master and propagated this information to other Sentinels via the channel __sentinel__:hello, so that clients would get the new master information.
+
+### Simulating a master down
+
+1. On Sentinel-1, at 17:05:02.446, it found the master server was unreachable. As we mentioned in the previous recipe, each Sentinel will ping the Redis master, slaves, and other Sentinels regularly. If a ping times out, the server will be regarded as down by the Sentinel. However, this is only a subjective view of one Sentinel, namely subjectively down (+sdown in Sentinel events). In this example, Sentinel-1 marked the master as +sdown.
+2. To prevent false alarms, the Sentinel that marked the master as +sdown will send requests to other Sentinels to ask for their view of the master instance. Actions will be taken only when more than the number of <quorum> Sentinels view the master as down, which is called **objectively down (+odown)**. In this example, Sentinel-1 got the response from other Sentinels at 17:05:03.570 and marked the master as +odown.
+3. Next, Sentinel-1 attempted to perform the failover but did not get elected as the leader.
+4. Almost at the same time, Sentinel-2 also marked the master as +sdown and +odown, and it was elected as the leader to perform the failover. The rest of the process is the same as  in the step triggering a master failover manually.
+
+**How was the leader elected?** The vote starts after +down on one of the Sentinels; the Sentinel will start soliciting votes for itself from other Sentinels. Each Sentinel has one vote only. Once another Sentinel receives the solicitation, if it hasn't voted before, it will accept the solicitation and reply to the solicitor. Otherwise, it will reject the solicitation and reply with the other leader it just voted. If a Sentinel has received greater than or equal to max (quorum, number of sentinels / 2 + 1) votes (including itself; the Sentinel will vote for itself before soliciting votes from others), it will become the leader. If a leader was not elected, the process will repeat.
+
+### Simulating two slaves down
+
+The option min-slaves-to-write means the minimum slaves required to accept the write request. As there were no slaves, the write request was rejected by the master.
+
+### Simulating one Sentinel down
+
+Stopping one Sentinel did not affect the failover process in this experiment, because the quorum could still be met for objectively down and the leader election.
+
+### Simulating two Sentinels down
+
+Leaving one Sentinel running alone could not trigger objectively down as well as the leader election, therefore the Sentinel only marked +sdown for the master, and the failover never happened.
+
+## Administrating Sentinel
+
+Email on event and failover, Sentinel could execute customized script when event fired or failover happens.
+
+In the example of executing scripts on Sentinel events, we set up a Python script to automatically send out notification emails whenever there is a new Sentinel event. This is called notification-script in Sentinel configuration. The arguments that are passed to the script are <event_type> and <event_description>. 
+
+In the example of executing scripts on failover, we set up a shell script to automatically update the RDB persistence configuration whenever failover happens. This is called client-reconfig-script in Sentinel configuration.
+
+The arguments that are passed to the script are <master-name> <role> <state> <from-ip> <from-port> <to-ip> <to-port>, where <state> is always failover, <role> is the role of the current Sentinel (leader or observer), <from-ip> and <from-port> are the IP address and port of the old master, and <to-ip> and <to-port> are the IP address and port of the new master.
+
+Both the notification-script and client-config-script will be executed on all Sentinels that have the option enabled in the configuration. For our email notification use case, we just need to enable notification-script on one of the Sentinels, because usually the events we are interested will appear on all Sentinels and only one email should be sent out.
+
+The script should return 0 if the execution is successful. It will be retried up to 10 times if the return value is 1. If a script does not finish in 60 seconds, it will be terminated with a SIGKILL and will be retried up to 10 times. The script will not be retried if returning a value higher than 1.
+
+## 
+
+
+
+
+
+
+
+
+
+
+

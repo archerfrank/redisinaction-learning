@@ -2324,14 +2324,286 @@ Check out reshard and add or remove master node.
 https://medium.com/@iamvishalkhare/horizontal-scaling-in-out-techniques-for-redis-cluster-dcd75c696c86 
 
 
+## Deploying to a Production Environment
+
+### OS configuration
+
+We will go through each setting or parameter mentioned in the previous section. The first setting we tweaked is **overcommit_memory**. As described in Chapter 6, Persistence, Redis takes advantage of copy-on-write (COW) when starting a background save. That means there is no need to have as much free RAM as the size of dataset in Redis. However, Linux, by default, may have the chance to check if there is enough free RAM to duplicate all the parent processes' memory pages. It may lead to the risk of getting a process OOM-killed. 
+
+To solve the problem, you should set overcommit to 1, that indicates, when a program calls something such as malloc() to allocate a chunk of memory, it will always succeed even if the system knows it does not have all the memory space that is being asked for. The second memory-related setting is **vm.swappiness**. This parameter defines how much (and how often) your Linux kernel will copy RAM contents to swap.
+
+It's always recommended to set vm.swappiness to 0. It's worth mentioning that setting this parameter to 0 has different meanings for the different kernel versions:
+
+The next tweak we made is **disabling the transparent huge page** feature provided by the Linux kernel. 
+
+For networking, we set the **net.core.somaxconn and net.ipv4.tcp_max_syn_backlog to 65535**, which is much higher than the default value of 128. In Redis, there is an option, tcp-backlog, with the default value 511. Setting these values higher can optimize the TCP connections.
+
+Lastly, we also set the **max number of files** that a process is able to open. It's required to make sure that the value of this OS parameter is higher than the option **maxclients** in Redis. If that is not satisfied, you will see the following logs in the Redis running log:
+
+### Securing Redis
+
+you are strongly advised not to expose Redis to the public network. If your Redis Server has to be accessed via the public network, using a **binding** port different from the default port of 6379 would somewhat alleviate the risk of port scanners, although it is not difficult to detect the server behind the port via Redis protocols.
+
+The Redis authentication password resides in the configuration file as plain text.
+
+The password option in a Redis master instance will not be inherited by slave instances, therefore you have to set the password for slaves separately. Renaming or disabling dangerous commands prevents high-risk operations, even if the server is compromised.
+
+### Setting client connection options
+
+The option **maxclients** limits the max number of connections from clients. Once the number of connections exceeds this limit, the incoming connections will receive an error message, as follows, and be closed immediately
+
+The next option is **tcp-keepalive**. If a non-zero value is set for this option, the server will send TCP ACK at the specified time interval to notify the network equipment, in between that the connection is still alive. If a client does not respond to TCP alive messages, the client is treated as dead and the connection is closed by the server. It's extremely useful when there is a hardware firewall between your clients and Redis Server.
+
+*For example, the firewall of Juniper will cut off the connection between client and itself, when the connection has been in an idle state for 1,800 seconds. However, both the client side and the server side won't get informed about the disconnection. So, from the server's point of view, the connection is still alive. If you disable this option, the server won't release the connection. On the other hand, from the client's point of view, it will reconnect to the Redis Server once it has found a disconnection. That causes the number of connections to continuously increase. So, keeping the default setting is preferable to prevent such connection issues from happening. By default, this option is set to 300.*
+
+```
+client-output-buffer-limit <class> <hard limit> <soft limit> <soft seconds>
+```
+
+Instead of sending the output of a command directly to the client, Redis will first populate the result into an output buffer for every connection and then send the content in one shot. Different kinds of clients (normal connection, pub/sub connection, slaves connection) have different output buffer sizes. 
+
+### Configuring memory policy
+
+maxmemory 
+
+maxmemory-policy
+
+| Option          | Action                                                                                                                                    |   |   |   |
+|-----------------|-------------------------------------------------------------------------------------------------------------------------------------------|---|---|---|
+| noeviction      | Don't evict anything, just return an error on write operations (except DEL and other commands that do not require more memory space).     |   |   |   |
+| allkeys-lru     | Evict any key using approximated Least Recently Used (LRU) algorithm.                                                                     |   |   |   |
+| volatile-lru    | Evict using approximated LRU algorithm among the keys with a timeout set. Fall back to the noeviction policy if no such key can be found. |   |   |   |
+| allkeys-lfu     | Evict any key using approximated Least Frequently Used (LFU) algorithm.                                                                   |   |   |   |
+| volatile-lfu    | Evict using approximated LFU among the keys with a timeout set. Fall back to the noeviction policy if no such key can be found.           |   |   |   |
+| allkeys-random  | Evict a random key, could be any key.                                                                                                     |   |   |   |
+| volatile-random | Evict a random key among the ones with a timeout set. Fall back to the noeviction policy if no such key can be found.                     |   |   |   |
+| volatile-ttl    | Evict the key with the nearest expire time (minor TTL). Fall back to the noeviction policy if no such key can be found.                   |   |   |   |
+|                 | 
+
+It is advisable to set a maxmemory value on production Redis Servers, this is extremely useful and important when deploying multiple Redis instances on the same host. Each instance is isolated in terms of memory usage and will not be impacted by other instances.
+
+If you are going to use Redis as a cache server, it is imperative to set the maxmemory-policy to a value other than noeviction. However, you should avoid having Redis evict keys too frequently, as the key eviction process significantly impacts server performance. 
+
+### Benchmarking
+
+Lastly, if you want to do a benchmark of a Redis Cluster with N shards, the performance of the Cluster can be roughly estimated through the benchmarking result against one of the N shards multiplied by N.
+
+### Logging
+
+```
+logfile "/var/log/redis/redis-server.log" 
+
+pid:role timestamp loglevel message 
+
+X Sentinel 
+C RDB/AOF writing child
+S slave
+M master
 
 
+1580:M 19 Nov 15:39:39.502 * Starting BGSAVE for SYNC with target: disk 
+1580:M 19 Nov 15:39:39.503 * Background saving started by pid 1584 
+1584:C 19 Nov 15:39:39.507 * DB saved on disk 
+
+1710:X 19 Nov 15:48:18.014 # Sentinel ID is 3ef95f7fd6420bfe22e38bfded1399382a63ce5b 
+1710:X 19 Nov 15:48:18.014 # +monitor master mymaster 192.168.0.33 6379 quorum 2 
+1710:X 19 Nov 15:48:18.513 - Accepted 192.168.0.33:37898
+
+1645:S 19 Nov 15:46:22.916 * Connecting to MASTER 192.168.0.33:6379 
+1645:S 19 Nov 15:46:22.917 * MASTER <-> SLAVE sync started 
+1645:S 19 Nov 15:46:22.917 # Error condition on socket for SYNC: Connection refused 
+1645:S 19 Nov 15:46:23.926 * Connecting to MASTER 192.168.0.33:6379 
+1645:S 19 Nov 15:46:23.926 * MASTER <-> SLAVE sync started 
+1645:S 19 Nov 15:46:23.926 * Non blocking connect for SYNC fired the event. 
+1645:S 19 Nov 15:46:23.926 * Master replied to PING, replication can continue... 
+```
 
 
+## Administrating Redis
+
+ get the CSV format of a command output, use the option --csv:
+
+ ```
+$ bin/redis-cli LPUSH listkeyA value1 value2 value3(integer) 
+3
+$ bin/redis-cli --csv LRANGE listkeyA 0 -1
+"value3","value2","value1"
+ ```
+
+### Restoring Redis data from an RDB file
+
+If AOF is not enabled, skip this step and progress to step 3. Otherwise, disable AOF first:
+
+```sh
+$ bin/redis-cli CONFIG SET appendonly no
+OK
+$ bin/redis-cli CONFIG REWRITE
+OK
+```
+
+Shut down Redis Server and delete or rename both AOF and RDB files in the data directory:
+
+```sh
+$ bin/redis-cli SHUTDOWN
+$ rm *.aof *.rdb
+```
+
+Now, copy the snapshot RDB file to be restored into the Redis data directory and rename it dump.rdb: (make sure it matches dbfilename in configuration):
+
+```sh
+$ cp /mnt/backup/redis/dump.201712250100.rdb /var/lib/redis/dump.rdb
+Set the correct permission to dump.rdb and start Redis Server:
+$ chown redis:redis dump.rdb
+$ bin/redis-server conf/redis-server.conf
+```
+
+Re-enable AOF persistence, if needed:
+
+```sh
+$ bin/redis-cli CONFIG SET appendonly yes
+OK
+$ bin/redis-cli CONFIG REWRITE
+OK
+```
+It is important to disable AOF before restoring data to Redis, because Redis will try to restore data from the AOF file if AOF is enabled. If the AOF file can not be found (we deleted/renamed it in step 3), Redis will be started with an empty dataset. 
+
+### Monitor memory
+
+```sh
+$ bin/redis-cli INFO MEMORY
+# Memory
+used_memory:211428088
+used_memory_human:201.63M
+used_memory_rss:251547648
+used_memory_rss_human:239.89M
+used_memory_peak:3865330064
+used_memory_peak_human:3.60G
+used_memory_peak_perc:5.47%
+used_memory_overhead:49242362
+used_memory_startup:765624
+used_memory_dataset:162185726
+used_memory_dataset_perc:76.99%
+total_system_memory:67467202560
+total_system_memory_human:62.83G
+used_memory_lua:40960
+used_memory_lua_human:40.00K
+maxmemory:4000000000
+maxmemory_human:3.73G
+maxmemory_policy:noeviction
+mem_fragmentation_ratio:1.19
+mem_allocator:jemalloc-4.0.3
+active_defrag_running:0
+lazyfree_pending_objects:0
+```
+
+**INFO MEMORY** is the most widely used command to obtain the memory usage of the whole Redis instance. Here is the meaning of each metric returned by this command
+
+### Managing clients
+
+INFO CLIENTS
+
+```sh
+$ bin/redis-cli INFO CLIENTS
+# Clients
+connected_clients:12
+client_longest_output_list:28
+client_biggest_input_buf:0
+blocked_clients:1
+$ bin/redis-cli INFO STATS |grep connection
+total_connections_received:4921
+rejected_connections:0
+```
+CLIENT LIST
+
+CLIENT KILL
+
+127.0.0.1:6379> CLIENT KILL 127.0.0.1:46254
+OK
+
+Please consider that the memory allocated for query buffer and output buffer are calculated into used_memory_overhead returned by the INFO MEMORY command excluding the output buffer of the monitor client.
+
+Due to the fact that **used_memory = used_memory_overhead + used_memory_dataset**, these two kinds of buffer are also taken into account  by the used_memory metric.
+
+### Data migration
 
 
+## Troubleshooting Redis
+
+```
+127.0.0.1:6379> INFO stats
+# Stats
+total_connections_received:1
+total_commands_processed:18
+instantaneous_ops_per_sec:0
+total_net_input_bytes:671
+total_net_output_bytes:13183
+instantaneous_input_kbps:0.00
+instantaneous_output_kbps:0.00
+rejected_connections:0
+sync_full:0
+sync_partial_ok:0
+sync_partial_err:0
+expired_keys:0
+evicted_keys:0
+keyspace_hits:0
+keyspace_misses:0
+...
+latest_fork_usec:415
+...
+    
+127.0.0.1:6379> INFO clients
+# Clients
+connected_clients:1
+client_longest_output_list:0
+client_biggest_input_buf:0
+blocked_clients:0    
+    
+127.0.0.1:6379> INFO persistence
+# Persistence
+loading:0
+rdb_changes_since_last_save:0
+rdb_bgsave_in_progress:0
+rdb_last_save_time:1514662415
+rdb_last_bgsave_status:ok
+rdb_last_bgsave_time_sec:-1
+rdb_current_bgsave_time_sec:-1
+rdb_last_cow_size:0
+aof_enabled:0
+aof_rewrite_in_progress:0
+aof_rewrite_scheduled:0
+aof_last_rewrite_time_sec:-1
+aof_current_rewrite_time_sec:-1
+aof_last_bgrewrite_status:ok
+aof_last_write_status:ok
+aof_last_cow_size:0  
 
 
+$ bin/redis-cli --stat
+------- data ------ -------------------- load ------------------- - child -
+keys       mem      clients blocked requests            connections
+680765     27.04G   541     0       60853686691 (+0)    2012384429  AO
+680961     27.04G   541     0       60853687586 (+895)  2012384431  AOF
+681162     27.04G   539     0       60853688521 (+935)  2012384433  AOF
+681362     27.04G   539     0       60853689496 (+975)  2012384435  AOF
+681549     27.04G   543     0       60853690312 (+816)  2012384442  AOF
 
+```
+The --stat option of redis-cli prints out the basic server metrics in real time, so that you can get a big picture of what's happening with memory usage, clients connected, and so on. By default, it prints out a new line every second, but the interval can be specified by the -i <interval> option.
 
+### Identifying slow queries using the SLOWLOG
 
+The default value of slowlog-log-slower-than is 10000 (10 milliseconds), a negative value of this option means disabling slow log, while setting the option to 0 will log all queries.
+
+The recorded slow queries or operations are pushed into a FIFO queue, the maximum size of which can be specified by slowlog-max-len, with the default value of 128. SLOWLOG GET prints all records in the queue. Alternatively, you can use SLOWLOG GET N to get the most recent N records.
+
+It is worth noting that the Redis slow log sub-system only considers the actual execution time of the command, because that is the time the server thread is blocked and unable to serve other requests. The disk I/O or network transmission time is not considered. 
+
+### Troubleshooting latency issues
+
+Due to the single-threaded model of Redis, the main redis-server process is only able to utilize one core of the processor. So, if the ps command shows CPU utilization of the redis-server process is near 100%, it means the Redis instance has been overloaded. 
+
+The next metric we checked is the total number of connections. If this metric is increasing dramatically in a short time, it indicates that some clients did not manage their connections to Redis properly.
+
+The persistence mechanism of Redis may cause high disk I/O times. One is the forking latency. The RDB background saves and AOF rewrite operation will fork new processes and incur latency on the main process. A Redis Server with a big dataset (greater than 16GB) may suffer from high fork latency. Another one is slow AOF latency.
+
+From the OS's point of view, we used the **iostat** command and found that there was an I/O wait, which is a signal of slow disk I/O.

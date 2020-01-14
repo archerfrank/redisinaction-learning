@@ -2607,3 +2607,6 @@ The next metric we checked is the total number of connections. If this metric is
 The persistence mechanism of Redis may cause high disk I/O times. One is the forking latency. The RDB background saves and AOF rewrite operation will fork new processes and incur latency on the main process. A Redis Server with a big dataset (greater than 16GB) may suffer from high fork latency. Another one is slow AOF latency.
 
 From the OS's point of view, we used the **iostat** command and found that there was an I/O wait, which is a signal of slow disk I/O.
+
+
+https://blog.csdn.net/Design407/article/details/103242874
